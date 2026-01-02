@@ -1,6 +1,5 @@
 'use client';
 
-import { useWalletMultiButton } from '@solana/wallet-adapter-react-ui';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { WalletMultiButton } from '@solana/wallet-adapter-react-ui';
 
@@ -14,7 +13,7 @@ import { WalletMultiButton } from '@solana/wallet-adapter-react-ui';
  * - Hush (Required)
  */
 export function WalletConnect() {
-  const { publicKey, connected, connecting, disconnect, wallet } = useWallet();
+  const { publicKey, connected, wallet } = useWallet();
 
   return (
     <div className="flex items-center gap-4">
