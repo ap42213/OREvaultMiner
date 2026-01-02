@@ -1,0 +1,128 @@
+OreVault
+OreVault.io | Technical Specification v1.0
+PRODUCTION SYSTEM - REAL SOL TRANSACTIONS ON MAINNET
+This system handles real cryptocurrency. All transactions use real SOL on Solana mainnet.
+1. Overview
+Automated mining system for ORE v3 on Solana mainnet. Uses Jito bundles with EV-based decision making. Last-second submission strategy. Manages in-account balances and claims.
+•	Wait until 0-2 seconds before round end
+•	Evaluate all 25 blocks on 5x5 grid
+•	Submit via Jito only if EV positive
+•	Track unclaimed balances in ORE account
+2. Rewards & Claims System
+Winnings go to ORE account, NOT directly to wallet
+When you win, rewards are held in your on-chain ORE account. Must be explicitly claimed to transfer to wallet. ORE takes 10% fee on all claims.
+2.1 Reward Flow
+WIN ROUND --> ORE ACCOUNT (on-chain)                - Unclaimed SOL                - Unclaimed ORE                - Refined ORE (accrues while holding)                     |                     | ClaimSOL / ClaimORE (10% fee)                     v                WALLET
+2.2 Balance Types
+Balance Type	Location	Description
+Wallet SOL	User wallet	Available for betting
+Wallet ORE	User wallet	Claimed ORE tokens
+Unclaimed SOL	ORE account	Won SOL, pending claim
+Unclaimed ORE	ORE account	Earned ORE, pending claim
+Refined ORE	ORE account	Accrues while holding ORE
+2.3 Claim Fees
+Type	Fee	Example	Net
+ClaimSOL	10%	1.0 SOL	0.9 SOL
+ClaimORE	10%	100 ORE	90 ORE
+3. Wallet Integration
+Real wallet connections for mainnet transactions
+Wallet	Adapter	Priority
+Phantom	@solana/wallet-adapter-phantom	Required
+Backpack	@solana/wallet-adapter-backpack	Required
+Solflare	@solana/wallet-adapter-solflare	Required
+Hush	@solana/wallet-adapter-wallets	Required
+4. Program ID
+Program	Address (Mainnet)
+ORE v3	oreV3EG1i9BEgiAJ8b177Z2S2rMarzak4NMv1kULvWv
+4.1 Dependencies
+Crate	Version	Purpose
+ore-api	3.6.0+	ORE v3 program API
+solana-sdk	2.1	Solana transactions
+solana-client	2.1	RPC client
+jito-sdk	latest	Bundle submission
+tokio	1.x	Async runtime
+sqlx	0.7	PostgreSQL driver
+5. Architecture
+BROWSER (Phantom/Backpack/Solflare/Hush)   Signs mainnet transactions | Balance display | Claim UI        | WebSocket        v VPS (NYC) - Strategy engine | Jito submission | Claims processor        | RPC        v SOLANA MAINNET + JITO (NY)
+5.1 Infrastructure
+Layer	Technology	Cost/Mo
+Frontend	Vercel	$0
+Database	Supabase	$0
+VPS	Vultr NYC	$12-24
+RPC	Helius (Mainnet)	$50+
+6. ORE v3 Mechanics
+60 second rounds. Deploy SOL on 5x5 grid blocks. RNG selects winner. Losing SOL redistributes to winners. Winnings go to ORE account (not wallet).
+6.1 Instructions
+Instruction	Description
+Deploy	Deploy real SOL to a block (0-24)
+Reset	Reset board for new round
+ClaimORE	Claim ORE from account to wallet (10% fee)
+ClaimSOL	Claim SOL from account to wallet (10% fee)
+Checkpoint	Checkpoint rewards from prior round
+7. Timing Strategy
+Round: 60s | Other bots: T=55-58s | OreVault: T=58-60s T-2.0s: Snapshot 25 blocks T-1.8s: Calculate EV per block T-1.6s: GO/NO-GO decision T-1.0s: Submit Jito bundle T-0.0s: Round closes
+8. EV Calculation
+EV = (potential_reward * 1/25) - tip_cost
+potential_reward = total_pot * (your_deploy / block_total). Skip round if best EV < 0.
+9. Database Schema
+9.1 transactions
+id, user_wallet, round_id, tx_signature, block_index, deploy_amount, tip_amount, expected_ev, actual_reward, status (pending/won/lost/skipped/failed), strategy, timestamps
+9.2 sessions
+id, user_wallet, strategy, max_tip, deploy_amount, budget, rounds_played, rounds_skipped, total_deployed, total_tips, total_won, net_pnl, timestamps
+9.3 unclaimed_balances
+Tracks balances held in ORE account (not yet claimed to wallet).
+id, user_wallet (unique), unclaimed_sol, unclaimed_ore, refined_ore, last_synced, timestamps
+9.4 claims
+Tracks all claim transactions.
+id, user_wallet, claim_type (sol/ore), gross_amount, fee_amount (10%), net_amount, tx_signature, status (pending/confirmed/failed), timestamps
+9.5 balance_history
+Audit trail for balance changes.
+id, user_wallet, balance_type, change_amount, reason, reference_id, balance_before, balance_after, timestamp
+10. API
+10.1 REST - Mining
+Method	Endpoint	Description
+POST	/api/session/start	Start autominer
+POST	/api/session/stop	Stop autominer
+GET	/api/stats	Session stats
+GET	/api/transactions	Bet history
+10.2 REST - Balances & Claims
+Method	Endpoint	Description
+GET	/api/balances	All balances (wallet + unclaimed)
+POST	/api/balances/sync	Sync from on-chain ORE account
+POST	/api/claim/sol	Claim SOL (returns tx to sign)
+POST	/api/claim/ore	Claim ORE (returns tx to sign)
+GET	/api/claims/history	Past claim transactions
+10.3 Balances Response
+{ wallet: { sol, ore },   unclaimed: { sol, ore, refined_ore },   claimable: { sol, ore },  // after 10% fee   last_synced }
+10.4 WebSocket Events
+Event	Payload
+round:update	{ round_id, time_left, blocks[] }
+decision:made	{ action, block, ev }
+tx:confirmed	{ signature, status, reward }
+balance:update	{ unclaimed_sol, unclaimed_ore, refined_ore }
+claim:confirmed	{ type, net_amount, tx_signature }
+11. Frontend
+Clean, minimal, no emojis, dark theme, monospace for numbers, optional 5x5 grid.
+11.1 Components
+1.	WalletConnect - Phantom, Backpack, Solflare, Hush
+2.	BalanceDisplay - Shows wallet AND unclaimed balances
+3.	ClaimPanel - Claim SOL/ORE with fee preview
+4.	ClaimModal - Confirmation with net amount after 10% fee
+5.	BetConfig - Deploy amount, max tip, budget
+6.	StrategySelect - Best EV, Conservative, Aggressive
+7.	Stats - Wins, losses, skips, P&L
+8.	Grid - Optional 5x5 display
+11.2 Balance Display Layout
+WALLET                 IN ACCOUNT (Unclaimed) 2.500 SOL              0.850 SOL  [Claim] 150.0 ORE              42.50 ORE  [Claim]                        3.20 Refined ORE
+11.3 Claim Modal
+CLAIM SOL Available:    0.850 SOL Fee (10%):   -0.085 SOL You receive:  0.765 SOL [Cancel] [Confirm]
+12. Jito Integration
+Block Engine: ny.mainnet.block-engine.jito.wtf
+Flow: Build Deploy tx -> Add tip -> Sign -> sendBundle gRPC -> Monitor
+13. Environment
+SOLANA_NETWORK=mainnet-beta RPC_URL=<helius_mainnet> JITO_BLOCK_ENGINE=ny.mainnet.block-engine.jito.wtf DATABASE_URL=postgresql://... ORE_PROGRAM_ID=oreV3EG1i9BEgiAJ8b177Z2S2rMarzak4NMv1kULvWv CLAIM_FEE_PERCENT=10
+14. Project Structure
+orevault/   frontend/     components/ WalletConnect, BalanceDisplay, ClaimPanel,                 ClaimModal, BetConfig, Stats, Grid   backend/src/     main.rs, strategy.rs, jito.rs, ore.rs,     claims.rs, balances.rs, db.rs, ws.rs   migrations/
+15. Deployment
+VPS: Vultr NYC. Install Rust, Node, Postgres. Configure for mainnet. Run migrations. Start with systemd.
+This system uses real SOL. Test with small amounts first.
