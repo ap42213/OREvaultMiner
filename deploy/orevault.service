@@ -1,0 +1,25 @@
+[Unit]
+Description=OreVault Mining Backend
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=orevault
+WorkingDirectory=/opt/orevault/backend
+Environment=RUST_LOG=orevault=info,tower_http=info
+EnvironmentFile=/opt/orevault/backend/.env
+ExecStart=/opt/orevault/backend/target/release/orevault
+Restart=always
+RestartSec=5
+
+# Resource limits
+LimitNOFILE=65535
+MemoryMax=2G
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=orevault
+
+[Install]
+WantedBy=multi-user.target
