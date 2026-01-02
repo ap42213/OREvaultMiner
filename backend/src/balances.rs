@@ -110,12 +110,12 @@ impl BalanceManager {
     pub async fn sync_from_chain(&self, wallet: &str, db: &Database) -> Result<AllBalances> {
         let balances = self.get_all_balances(wallet).await?;
         
-        // Update database with new balances
-        db.update_unclaimed_balances(
+        // Update database with new balances (convert f64 to lamports i64)
+        db.update_unclaimed_balance(
             wallet,
-            balances.unclaimed.sol,
-            balances.unclaimed.ore,
-            balances.unclaimed.refined_ore,
+            (balances.unclaimed.sol * 1_000_000_000.0) as i64,
+            (balances.unclaimed.ore * 1_000_000_000.0) as i64,
+            (balances.unclaimed.refined_ore * 1_000_000_000.0) as i64,
         ).await?;
         
         info!(

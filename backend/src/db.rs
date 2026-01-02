@@ -2,12 +2,12 @@
 //! 
 //! PostgreSQL database operations using sqlx.
 //! Handles sessions, transactions, balances, and claims.
+//! All amounts stored as i64 (lamports for SOL, raw units for ORE).
 
 use anyhow::{Result, Context};
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use sqlx::{postgres::PgPool, FromRow};
+use sqlx::{postgres::PgPool, FromRow, Postgres};
 use uuid::Uuid;
 use tracing::{debug, info};
 
@@ -20,7 +20,7 @@ pub struct Database {
 }
 
 // =============================================================================
-// Data Models
+// Data Models (using i64 for all amounts - stored as lamports)
 // =============================================================================
 
 /// Mining session record
@@ -29,15 +29,15 @@ pub struct Session {
     pub id: Uuid,
     pub user_wallet: String,
     pub strategy: String,
-    pub max_tip: Decimal,
-    pub deploy_amount: Decimal,
-    pub budget: Decimal,
+    pub max_tip: i64,
+    pub deploy_amount: i64,
+    pub budget: i64,
     pub rounds_played: i64,
     pub rounds_skipped: i64,
-    pub total_deployed: Decimal,
-    pub total_tips: Decimal,
-    pub total_won: Decimal,
-    pub net_pnl: Decimal,
+    pub total_deployed: i64,
+    pub total_tips: i64,
+    pub total_won: i64,
+    pub net_pnl: i64,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -52,10 +52,10 @@ pub struct Transaction {
     pub round_id: i64,
     pub tx_signature: Option<String>,
     pub block_index: i16,
-    pub deploy_amount: Decimal,
-    pub tip_amount: Decimal,
-    pub expected_ev: Decimal,
-    pub actual_reward: Option<Decimal>,
+    pub deploy_amount: i64,
+    pub tip_amount: i64,
+    pub expected_ev: i64,
+    pub actual_reward: Option<i64>,
     pub status: String,
     pub strategy: String,
     pub created_at: DateTime<Utc>,
@@ -89,9 +89,9 @@ impl TxStatus {
 pub struct UnclaimedBalance {
     pub id: Uuid,
     pub user_wallet: String,
-    pub unclaimed_sol: Decimal,
-    pub unclaimed_ore: Decimal,
-    pub refined_ore: Decimal,
+    pub unclaimed_sol: i64,
+    pub unclaimed_ore: i64,
+    pub refined_ore: i64,
     pub last_synced: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -103,9 +103,9 @@ pub struct Claim {
     pub id: Uuid,
     pub user_wallet: String,
     pub claim_type: String,
-    pub gross_amount: Decimal,
-    pub fee_amount: Decimal,
-    pub net_amount: Decimal,
+    pub gross_amount: i64,
+    pub fee_amount: i64,
+    pub net_amount: i64,
     pub tx_signature: Option<String>,
     pub status: String,
     pub created_at: DateTime<Utc>,
@@ -118,11 +118,11 @@ pub struct BalanceHistory {
     pub id: Uuid,
     pub user_wallet: String,
     pub balance_type: String,
-    pub change_amount: Decimal,
+    pub change_amount: i64,
     pub reason: String,
     pub reference_id: Option<Uuid>,
-    pub balance_before: Decimal,
-    pub balance_after: Decimal,
+    pub balance_before: i64,
+    pub balance_after: i64,
     pub created_at: DateTime<Utc>,
 }
 
@@ -133,10 +133,10 @@ pub struct SessionStats {
     pub rounds_skipped: i64,
     pub rounds_won: i64,
     pub rounds_lost: i64,
-    pub total_deployed: f64,
-    pub total_tips: f64,
-    pub total_won: f64,
-    pub net_pnl: f64,
+    pub total_deployed: i64,
+    pub total_tips: i64,
+    pub total_won: i64,
+    pub net_pnl: i64,
     pub win_rate: f64,
 }
 
@@ -160,13 +160,14 @@ impl Database {
     // =========================================================================
     
     /// Create a new mining session
+    /// Amounts are in lamports (1 SOL = 1_000_000_000 lamports)
     pub async fn create_session(
         &self,
         wallet: &str,
         strategy: Strategy,
-        max_tip: f64,
-        deploy_amount: f64,
-        budget: f64,
+        max_tip: i64,
+        deploy_amount: i64,
+        budget: i64,
     ) -> Result<Session> {
         let strategy_str = match strategy {
             Strategy::BestEv => "best_ev",
@@ -188,9 +189,9 @@ impl Database {
         .bind(Uuid::new_v4())
         .bind(wallet)
         .bind(strategy_str)
-        .bind(Decimal::try_from(max_tip).unwrap_or_default())
-        .bind(Decimal::try_from(deploy_amount).unwrap_or_default())
-        .bind(Decimal::try_from(budget).unwrap_or_default())
+        .bind(max_tip)
+        .bind(deploy_amount)
+        .bind(budget)
         .fetch_one(&self.pool)
         .await
         .context("Failed to create session")?;
@@ -225,19 +226,16 @@ impl Database {
         Ok(session)
     }
     
-    /// Update session statistics
+    /// Update session statistics (amounts in lamports)
     pub async fn update_session_stats(
         &self,
         session_id: Uuid,
-        deployed: f64,
-        tip: f64,
-        reward: Option<f64>,
+        deployed: i64,
+        tip: i64,
+        reward: Option<i64>,
         is_skip: bool,
     ) -> Result<()> {
-        let won = reward.unwrap_or(0.0);
-        let deployed_dec = Decimal::try_from(deployed).unwrap_or_default();
-        let tip_dec = Decimal::try_from(tip).unwrap_or_default();
-        let won_dec = Decimal::try_from(won).unwrap_or_default();
+        let won = reward.unwrap_or(0);
         
         if is_skip {
             sqlx::query(
@@ -252,6 +250,7 @@ impl Database {
             .execute(&self.pool)
             .await?;
         } else {
+            let net = won - deployed - tip;
             sqlx::query(
                 r#"
                 UPDATE sessions SET
@@ -259,15 +258,16 @@ impl Database {
                     total_deployed = total_deployed + $2,
                     total_tips = total_tips + $3,
                     total_won = total_won + $4,
-                    net_pnl = total_won - total_deployed - total_tips,
+                    net_pnl = net_pnl + $5,
                     updated_at = NOW()
                 WHERE id = $1
                 "#,
             )
             .bind(session_id)
-            .bind(deployed_dec)
-            .bind(tip_dec)
-            .bind(won_dec)
+            .bind(deployed)
+            .bind(tip)
+            .bind(won)
+            .bind(net)
             .execute(&self.pool)
             .await?;
         }
@@ -275,57 +275,48 @@ impl Database {
         Ok(())
     }
     
-    /// Get session statistics
-    pub async fn get_session_stats(&self, wallet: &str) -> Result<SessionStats> {
-        let result = sqlx::query_as::<_, (i64, i64, Decimal, Decimal, Decimal, Decimal)>(
-            r#"
-            SELECT 
-                COALESCE(SUM(rounds_played), 0),
-                COALESCE(SUM(rounds_skipped), 0),
-                COALESCE(SUM(total_deployed), 0),
-                COALESCE(SUM(total_tips), 0),
-                COALESCE(SUM(total_won), 0),
-                COALESCE(SUM(net_pnl), 0)
-            FROM sessions
-            WHERE user_wallet = $1
-            "#,
+    /// Get session stats
+    pub async fn get_session_stats(&self, session_id: Uuid) -> Result<SessionStats> {
+        let session = sqlx::query_as::<_, Session>(
+            "SELECT * FROM sessions WHERE id = $1"
         )
-        .bind(wallet)
+        .bind(session_id)
         .fetch_one(&self.pool)
         .await
-        .context("Failed to get session stats")?;
+        .context("Session not found")?;
         
-        // Count wins and losses from transactions
-        let (wins, losses): (i64, i64) = sqlx::query_as(
-            r#"
-            SELECT 
-                COALESCE(SUM(CASE WHEN status = 'won' THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN status = 'lost' THEN 1 ELSE 0 END), 0)
-            FROM transactions
-            WHERE user_wallet = $1
-            "#,
+        let rounds_won = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM transactions WHERE session_id = $1 AND status = 'won'"
         )
-        .bind(wallet)
+        .bind(session_id)
         .fetch_one(&self.pool)
         .await
-        .unwrap_or((0, 0));
+        .unwrap_or(0);
         
-        let rounds_played = result.0;
-        let win_rate = if rounds_played > 0 {
-            wins as f64 / rounds_played as f64 * 100.0
+        let rounds_lost = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM transactions WHERE session_id = $1 AND status = 'lost'"
+        )
+        .bind(session_id)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+        
+        let total_rounds = rounds_won + rounds_lost;
+        let win_rate = if total_rounds > 0 {
+            rounds_won as f64 / total_rounds as f64
         } else {
             0.0
         };
         
         Ok(SessionStats {
-            rounds_played: result.0,
-            rounds_skipped: result.1,
-            rounds_won: wins,
-            rounds_lost: losses,
-            total_deployed: result.2.try_into().unwrap_or(0.0),
-            total_tips: result.3.try_into().unwrap_or(0.0),
-            total_won: result.4.try_into().unwrap_or(0.0),
-            net_pnl: result.5.try_into().unwrap_or(0.0),
+            rounds_played: session.rounds_played,
+            rounds_skipped: session.rounds_skipped,
+            rounds_won,
+            rounds_lost,
+            total_deployed: session.total_deployed,
+            total_tips: session.total_tips,
+            total_won: session.total_won,
+            net_pnl: session.net_pnl,
             win_rate,
         })
     }
@@ -334,16 +325,16 @@ impl Database {
     // Transaction Operations
     // =========================================================================
     
-    /// Record a new transaction
-    pub async fn create_transaction(
+    /// Record a new transaction (amounts in lamports)
+    pub async fn record_transaction(
         &self,
         wallet: &str,
         session_id: Option<Uuid>,
         round_id: i64,
         block_index: i16,
-        deploy_amount: f64,
-        tip_amount: f64,
-        expected_ev: f64,
+        deploy_amount: i64,
+        tip_amount: i64,
+        expected_ev: i64,
         strategy: &str,
     ) -> Result<Transaction> {
         let tx = sqlx::query_as::<_, Transaction>(
@@ -362,39 +353,40 @@ impl Database {
         .bind(session_id)
         .bind(round_id)
         .bind(block_index)
-        .bind(Decimal::try_from(deploy_amount).unwrap_or_default())
-        .bind(Decimal::try_from(tip_amount).unwrap_or_default())
-        .bind(Decimal::try_from(expected_ev).unwrap_or_default())
+        .bind(deploy_amount)
+        .bind(tip_amount)
+        .bind(expected_ev)
         .bind(strategy)
         .fetch_one(&self.pool)
         .await
-        .context("Failed to create transaction")?;
+        .context("Failed to record transaction")?;
         
+        debug!("Recorded transaction {} for round {}", tx.id, round_id);
         Ok(tx)
     }
     
-    /// Update transaction with result
-    pub async fn update_transaction(
+    /// Update transaction status
+    pub async fn update_transaction_status(
         &self,
         tx_id: Uuid,
-        signature: &str,
         status: TxStatus,
-        reward: Option<f64>,
+        signature: Option<&str>,
+        reward: Option<i64>,
     ) -> Result<()> {
         sqlx::query(
             r#"
             UPDATE transactions SET
-                tx_signature = $2,
-                status = $3,
+                status = $2,
+                tx_signature = COALESCE($3, tx_signature),
                 actual_reward = $4,
                 updated_at = NOW()
             WHERE id = $1
             "#,
         )
         .bind(tx_id)
-        .bind(signature)
         .bind(status.as_str())
-        .bind(reward.map(|r| Decimal::try_from(r).unwrap_or_default()))
+        .bind(signature)
+        .bind(reward)
         .execute(&self.pool)
         .await
         .context("Failed to update transaction")?;
@@ -402,7 +394,7 @@ impl Database {
         Ok(())
     }
     
-    /// Get transaction history for wallet
+    /// Get transactions for wallet
     pub async fn get_transactions(
         &self,
         wallet: &str,
@@ -431,20 +423,17 @@ impl Database {
     // Balance Operations
     // =========================================================================
     
-    /// Update unclaimed balances
-    pub async fn update_unclaimed_balances(
+    /// Update unclaimed balance (amounts in lamports/raw units)
+    pub async fn update_unclaimed_balance(
         &self,
         wallet: &str,
-        unclaimed_sol: f64,
-        unclaimed_ore: f64,
-        refined_ore: f64,
+        unclaimed_sol: i64,
+        unclaimed_ore: i64,
+        refined_ore: i64,
     ) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO unclaimed_balances (
-                id, user_wallet, unclaimed_sol, unclaimed_ore, refined_ore,
-                last_synced, created_at, updated_at
-            )
+            INSERT INTO unclaimed_balances (id, user_wallet, unclaimed_sol, unclaimed_ore, refined_ore, last_synced, created_at, updated_at)
             VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), NOW())
             ON CONFLICT (user_wallet) DO UPDATE SET
                 unclaimed_sol = $3,
@@ -456,25 +445,25 @@ impl Database {
         )
         .bind(Uuid::new_v4())
         .bind(wallet)
-        .bind(Decimal::try_from(unclaimed_sol).unwrap_or_default())
-        .bind(Decimal::try_from(unclaimed_ore).unwrap_or_default())
-        .bind(Decimal::try_from(refined_ore).unwrap_or_default())
+        .bind(unclaimed_sol)
+        .bind(unclaimed_ore)
+        .bind(refined_ore)
         .execute(&self.pool)
         .await
-        .context("Failed to update unclaimed balances")?;
+        .context("Failed to update unclaimed balance")?;
         
         Ok(())
     }
     
-    /// Get unclaimed balances
-    pub async fn get_unclaimed_balances(&self, wallet: &str) -> Result<Option<UnclaimedBalance>> {
+    /// Get unclaimed balance for wallet
+    pub async fn get_unclaimed_balance(&self, wallet: &str) -> Result<Option<UnclaimedBalance>> {
         let balance = sqlx::query_as::<_, UnclaimedBalance>(
             "SELECT * FROM unclaimed_balances WHERE user_wallet = $1"
         )
         .bind(wallet)
         .fetch_optional(&self.pool)
         .await
-        .context("Failed to fetch unclaimed balances")?;
+        .context("Failed to fetch unclaimed balance")?;
         
         Ok(balance)
     }
@@ -483,14 +472,14 @@ impl Database {
     // Claims Operations
     // =========================================================================
     
-    /// Record a new claim
-    pub async fn create_claim(
+    /// Record a claim (amounts in lamports/raw units)
+    pub async fn record_claim(
         &self,
         wallet: &str,
         claim_type: &str,
-        gross_amount: f64,
-        fee_amount: f64,
-        net_amount: f64,
+        gross_amount: i64,
+        fee_amount: i64,
+        net_amount: i64,
     ) -> Result<Claim> {
         let claim = sqlx::query_as::<_, Claim>(
             r#"
@@ -505,35 +494,36 @@ impl Database {
         .bind(Uuid::new_v4())
         .bind(wallet)
         .bind(claim_type)
-        .bind(Decimal::try_from(gross_amount).unwrap_or_default())
-        .bind(Decimal::try_from(fee_amount).unwrap_or_default())
-        .bind(Decimal::try_from(net_amount).unwrap_or_default())
+        .bind(gross_amount)
+        .bind(fee_amount)
+        .bind(net_amount)
         .fetch_one(&self.pool)
         .await
-        .context("Failed to create claim")?;
+        .context("Failed to record claim")?;
         
+        info!("Recorded claim {} for wallet {}: {} {}", claim.id, wallet, gross_amount, claim_type);
         Ok(claim)
     }
     
-    /// Update claim with signature and status
-    pub async fn update_claim(
+    /// Update claim status
+    pub async fn update_claim_status(
         &self,
         claim_id: Uuid,
-        signature: &str,
         status: &str,
+        signature: Option<&str>,
     ) -> Result<()> {
         sqlx::query(
             r#"
             UPDATE claims SET
-                tx_signature = $2,
-                status = $3,
+                status = $2,
+                tx_signature = COALESCE($3, tx_signature),
                 updated_at = NOW()
             WHERE id = $1
             "#,
         )
         .bind(claim_id)
-        .bind(signature)
         .bind(status)
+        .bind(signature)
         .execute(&self.pool)
         .await
         .context("Failed to update claim")?;
@@ -541,7 +531,7 @@ impl Database {
         Ok(())
     }
     
-    /// Get claims history
+    /// Get claims for wallet
     pub async fn get_claims(
         &self,
         wallet: &str,
@@ -567,19 +557,19 @@ impl Database {
     }
     
     // =========================================================================
-    // Balance History Operations
+    // Balance History
     // =========================================================================
     
-    /// Record balance change in audit log
-    pub async fn record_balance_change(
+    /// Record balance change for audit
+    pub async fn record_balance_history(
         &self,
         wallet: &str,
         balance_type: &str,
-        change_amount: f64,
+        change_amount: i64,
         reason: &str,
         reference_id: Option<Uuid>,
-        balance_before: f64,
-        balance_after: f64,
+        balance_before: i64,
+        balance_after: i64,
     ) -> Result<()> {
         sqlx::query(
             r#"
@@ -593,15 +583,38 @@ impl Database {
         .bind(Uuid::new_v4())
         .bind(wallet)
         .bind(balance_type)
-        .bind(Decimal::try_from(change_amount).unwrap_or_default())
+        .bind(change_amount)
         .bind(reason)
         .bind(reference_id)
-        .bind(Decimal::try_from(balance_before).unwrap_or_default())
-        .bind(Decimal::try_from(balance_after).unwrap_or_default())
+        .bind(balance_before)
+        .bind(balance_after)
         .execute(&self.pool)
         .await
-        .context("Failed to record balance change")?;
+        .context("Failed to record balance history")?;
         
         Ok(())
+    }
+    
+    /// Get balance history for wallet
+    pub async fn get_balance_history(
+        &self,
+        wallet: &str,
+        limit: i64,
+    ) -> Result<Vec<BalanceHistory>> {
+        let history = sqlx::query_as::<_, BalanceHistory>(
+            r#"
+            SELECT * FROM balance_history
+            WHERE user_wallet = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(wallet)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to fetch balance history")?;
+        
+        Ok(history)
     }
 }

@@ -4,6 +4,7 @@
 //! Program ID: oreV3EG1i9BEgiAJ8b177Z2S2rMarzak4NMv1kULvWv
 
 use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::{Result, Context};
 use solana_client::rpc_client::RpcClient;
@@ -67,17 +68,17 @@ pub struct OreAccountBalance {
 /// ORE v3 client for interacting with the program
 #[derive(Clone)]
 pub struct OreClient {
-    rpc: AsyncRpcClient,
+    rpc: Arc<AsyncRpcClient>,
     program_id: Pubkey,
 }
 
 impl OreClient {
     /// Create a new ORE client
     pub fn new(rpc_url: &str) -> Result<Self> {
-        let rpc = AsyncRpcClient::new_with_commitment(
+        let rpc = Arc::new(AsyncRpcClient::new_with_commitment(
             rpc_url.to_string(),
             CommitmentConfig::confirmed(),
-        );
+        ));
         
         let program_id = Pubkey::from_str(ORE_PROGRAM_ID)
             .context("Invalid ORE program ID")?;

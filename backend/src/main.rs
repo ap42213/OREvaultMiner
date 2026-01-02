@@ -22,12 +22,9 @@ use axum::{
     extract::{State, Query, WebSocketUpgrade},
     response::IntoResponse,
 };
-use axum_extra::TypedHeader;
-use headers::authorization::Bearer;
-use headers::Authorization;
 use tower_http::cors::{CorsLayer, Any};
 use tower_http::trace::TraceLayer;
-use tracing::{info, Level};
+use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
@@ -188,12 +185,17 @@ async fn start_session(
     // Verify wallet signature for authentication
     // In production, verify the signature against a known message
     
+    // Convert f64 to lamports (i64)
+    let max_tip_lamports = (req.max_tip * 1_000_000_000.0) as i64;
+    let deploy_lamports = (req.deploy_amount * 1_000_000_000.0) as i64;
+    let budget_lamports = (req.budget * 1_000_000_000.0) as i64;
+    
     match state.db.create_session(
         &req.wallet,
         req.strategy.clone(),
-        req.max_tip,
-        req.deploy_amount,
-        req.budget,
+        max_tip_lamports,
+        deploy_lamports,
+        budget_lamports,
     ).await {
         Ok(session) => {
             // Start the strategy engine for this wallet
@@ -257,10 +259,23 @@ async fn get_stats(
     State(state): State<Arc<AppState>>,
     Query(query): Query<StatsQuery>,
 ) -> impl IntoResponse {
-    match state.db.get_session_stats(&query.wallet).await {
-        Ok(stats) => Json(serde_json::json!({
-            "success": true,
-            "stats": stats
+    // First get the active session for the wallet
+    match state.db.get_active_session(&query.wallet).await {
+        Ok(Some(session)) => {
+            match state.db.get_session_stats(session.id).await {
+                Ok(stats) => Json(serde_json::json!({
+                    "success": true,
+                    "stats": stats
+                })),
+                Err(e) => Json(serde_json::json!({
+                    "success": false,
+                    "error": e.to_string()
+                }))
+            }
+        }
+        Ok(None) => Json(serde_json::json!({
+            "success": false,
+            "error": "No active session found"
         })),
         Err(e) => Json(serde_json::json!({
             "success": false,
