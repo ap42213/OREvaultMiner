@@ -111,11 +111,19 @@ impl JitoClient {
         &self,
         transactions: Vec<Transaction>,
     ) -> Result<BundleResult> {
-        // Serialize transactions to base58 (Jito expects base58-encoded serialized tx bytes)
+        // Verify transactions are signed
+        for (i, tx) in transactions.iter().enumerate() {
+            if tx.signatures.is_empty() || tx.signatures[0] == Signature::default() {
+                error!("Transaction {} is not signed!", i);
+                return Err(anyhow::anyhow!("Transaction {} is not signed", i));
+            }
+        }
+        
+        // Jito expects base64-encoded serialized transactions (same format as sendTransaction)
         let serialized_txs: Vec<String> = transactions.iter()
             .map(|tx| {
-                let bytes = bincode::serialize(tx).unwrap();
-                bs58::encode(&bytes).into_string()
+                let bytes = bincode::serialize(tx).expect("Failed to serialize tx");
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
             })
             .collect();
         

@@ -691,14 +691,28 @@ impl StrategyEngine {
                 
                 info!("Signed transaction server-side for automine");
                 
-                // Submit via Jito
-                let result = jito_client.send_bundle(vec![tx]).await
-                    .context("Failed to submit bundle to Jito")?;
-                
-                info!("Bundle submitted to Jito: {}", result.bundle_id);
-                
-                // Return the bundle ID as signature placeholder
-                return Ok(result.bundle_id);
+                // Try Jito first
+                match jito_client.send_bundle(vec![tx.clone()]).await {
+                    Ok(result) => {
+                        info!("Bundle submitted to Jito: {}", result.bundle_id);
+                        return Ok(result.bundle_id);
+                    }
+                    Err(e) => {
+                        warn!("Jito failed: {}, falling back to direct RPC", e);
+                        
+                        // Fallback: send directly to RPC
+                        match ore_client.send_transaction(&tx).await {
+                            Ok(sig) => {
+                                info!("Transaction sent via RPC: {}", sig);
+                                return Ok(sig.to_string());
+                            }
+                            Err(rpc_err) => {
+                                error!("RPC fallback also failed: {}", rpc_err);
+                                return Err(anyhow::anyhow!("Both Jito and RPC failed: {} / {}", e, rpc_err));
+                            }
+                        }
+                    }
+                }
             }
         }
         
