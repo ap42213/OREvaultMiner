@@ -658,10 +658,23 @@ impl StrategyEngine {
         let board = ore_client.get_board_state().await?;
         info!("Current round: {} (end_slot: {})", board.round_id, board.end_slot);
 
-        // ORE checkpoint appears to be validated against the *previous* round.
-        // Using the current round can produce "Round not valid" and effectively no-op,
-        // which then causes deploy to fail with "Miner has not checkpointed".
-        let checkpoint_round_id = board.round_id.saturating_sub(1);
+        // Check if miner PDA exists and needs checkpointing.
+        // The ORE deploy instruction requires: miner.checkpoint_id == miner.round_id
+        // So we must checkpoint the miner's LAST round (miner.round_id), not the board's round.
+        let miner_data = ore_client.get_miner_data(&wallet_pubkey).await?;
+        let needs_checkpoint = match &miner_data {
+            Some(m) => {
+                info!(
+                    "Miner state: round_id={}, checkpoint_id={}, needs_checkpoint={}",
+                    m.round_id, m.checkpoint_id, m.checkpoint_id != m.round_id
+                );
+                m.checkpoint_id != m.round_id && m.round_id > 0
+            }
+            None => {
+                info!("Miner PDA does not exist yet - no checkpoint needed");
+                false
+            }
+        };
         
         // Build squares array - only the selected block is true
         let mut squares = [false; 25];
@@ -683,17 +696,25 @@ impl StrategyEngine {
             false,
         )?;
 
-        // Build checkpoint instruction first - REQUIRED before deploy each round
-        let checkpoint_ix = ore_client.build_checkpoint_instruction(
-            &wallet_pubkey,
-            &wallet_pubkey,
-            checkpoint_round_id,
-        )?;
-        info!(
-            "Checkpoint instruction built for round {} (current round: {})",
-            checkpoint_round_id,
-            board.round_id
-        );
+        // Build checkpoint instruction - uses the MINER's round_id (not board's)
+        // Only include if miner needs checkpointing
+        let checkpoint_ix = if needs_checkpoint {
+            let miner_round_id = miner_data.as_ref().unwrap().round_id;
+            let ix = ore_client.build_checkpoint_instruction(
+                &wallet_pubkey,
+                &wallet_pubkey,
+                miner_round_id,
+            )?;
+            info!(
+                "Checkpoint instruction built for miner's round {} (current board round: {})",
+                miner_round_id,
+                board.round_id
+            );
+            Some(ix)
+        } else {
+            info!("Skipping checkpoint - miner already checkpointed or new");
+            None
+        };
         
         // Build deploy instruction using ore-api SDK
         let deploy_ix = ore_client.build_deploy_instruction(
@@ -710,15 +731,27 @@ impl StrategyEngine {
         let blockhash = ore_client.get_latest_blockhash().await?;
         info!("Blockhash: {}", blockhash);
         
-        // Build bundle with automate + checkpoint + deploy + tip
+        // Build instructions list: automate + (optional checkpoint) + deploy
+        let mut instructions = vec![automate_ix];
+        if let Some(ckpt_ix) = checkpoint_ix {
+            instructions.push(ckpt_ix);
+        }
+        instructions.push(deploy_ix);
+        
+        let ix_count = instructions.len();
+        
+        // Build bundle with instructions + tip
         let mut tx = jito_client.build_bundle(
-            vec![automate_ix, checkpoint_ix, deploy_ix],
+            instructions,
             &wallet_pubkey,
             tip_amount,
             blockhash,
         )?;
 
-        info!("Transaction built with {} instructions (automate + checkpoint + deploy + tip)", tx.message.instructions.len());
+        info!("Transaction built with {} instructions (automate + {}checkpoint + deploy + tip)", 
+            tx.message.instructions.len(),
+            if ix_count == 3 { "" } else { "no " }
+        );
         
         // Check if we can sign server-side (automine)
         if let Some(ref wm) = wallet_manager {
