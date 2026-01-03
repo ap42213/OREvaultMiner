@@ -763,15 +763,29 @@ impl StrategyEngine {
                 
                 info!("Signed transaction server-side for automine");
                 
-                // Skip Jito for now, send directly to RPC for reliability
-                match ore_client.send_transaction(&tx).await {
-                    Ok(sig) => {
-                        info!("Transaction sent via RPC: {}", sig);
-                        return Ok(sig.to_string());
+                // Try Jito bundle submission first for better inclusion
+                match jito_client.send_bundle(vec![tx.clone()]).await {
+                    Ok(result) => {
+                        info!("Transaction sent via Jito bundle: {} (status: {:?})", result.bundle_id, result.status);
+                        // Return first signature from bundle
+                        if let Some(sig) = result.signatures.first() {
+                            return Ok(sig.to_string());
+                        }
+                        return Ok(result.bundle_id);
                     }
-                    Err(rpc_err) => {
-                        error!("RPC send failed: {}", rpc_err);
-                        return Err(anyhow::anyhow!("RPC failed: {}", rpc_err));
+                    Err(jito_err) => {
+                        warn!("Jito bundle failed, falling back to RPC: {}", jito_err);
+                        // Fallback to direct RPC
+                        match ore_client.send_transaction(&tx).await {
+                            Ok(sig) => {
+                                info!("Transaction sent via RPC fallback: {}", sig);
+                                return Ok(sig.to_string());
+                            }
+                            Err(rpc_err) => {
+                                error!("RPC fallback also failed: {}", rpc_err);
+                                return Err(anyhow::anyhow!("Both Jito and RPC failed: {}", rpc_err));
+                            }
+                        }
                     }
                 }
             }
