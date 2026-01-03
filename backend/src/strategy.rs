@@ -420,6 +420,8 @@ impl StrategyEngine {
     /// Wait until we're in the submission window (near end of round)
     async fn wait_for_submission_window(ore_client: &OreClient) -> Result<RoundState> {
         let mut log_counter = 0u32;
+        let mut last_round_id = 0u64;
+        
         loop {
             let round = ore_client.get_current_round_state().await?;
             let slots_remaining = ore_client.get_slots_remaining().await.unwrap_or(0);
@@ -431,24 +433,32 @@ impl StrategyEngine {
                     slots_remaining, round.round_id, round.total_deployed);
             }
             
-            // Submit when ~5-10 slots remaining (about 2-4 seconds)
-            if slots_remaining <= 10 && slots_remaining > 0 {
+            // Detect new round - submit immediately at round start to get in early
+            if round.round_id != last_round_id && last_round_id != 0 {
+                info!("New round {} detected, submitting early!", round.round_id);
+                last_round_id = round.round_id;
+                return Ok(round);
+            }
+            last_round_id = round.round_id;
+            
+            // Submit when ~20 slots remaining (about 8 seconds) - more buffer
+            if slots_remaining <= 20 && slots_remaining > 0 {
                 info!("Entering submission window: {} slots remaining", slots_remaining);
                 return Ok(round);
             }
             
             if slots_remaining == 0 {
-                // Round ended or waiting for first deploy, wait for next round
-                if log_counter % 10 == 1 {
-                    debug!("No active round (slots=0), waiting...");
-                }
-                sleep(Duration::from_secs(2)).await;
+                // Round just ended, poll fast to catch new round
+                sleep(Duration::from_millis(200)).await;
             } else if slots_remaining > 50 {
                 // Long wait, sleep longer
-                sleep(Duration::from_secs(5)).await;
+                sleep(Duration::from_secs(3)).await;
+            } else if slots_remaining > 20 {
+                // Getting closer
+                sleep(Duration::from_secs(1)).await;
             } else {
-                // Getting close, poll faster
-                sleep(Duration::from_millis(100)).await;
+                // Very close, poll faster
+                sleep(Duration::from_millis(50)).await;
             }
         }
     }
