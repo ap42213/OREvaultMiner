@@ -432,21 +432,21 @@ impl StrategyEngine {
                     slots_remaining, round.round_id, round.total_deployed);
             }
             
-            // Submit when ~20 slots remaining (about 8 seconds) - more buffer
-            if slots_remaining <= 20 && slots_remaining > 0 {
+            // Submit when ~30 slots remaining (about 12 seconds) - more buffer for checkpoint
+            if slots_remaining <= 30 && slots_remaining > 0 {
                 info!("Entering submission window: {} slots remaining", slots_remaining);
                 return Ok(round);
             }
             
             if slots_remaining == 0 {
-                // Round just ended, poll fast to catch new round
+                // Round just ended or hasn't started, poll fast to catch start of new round
                 sleep(Duration::from_millis(200)).await;
-            } else if slots_remaining > 50 {
-                // Long wait, sleep longer
-                sleep(Duration::from_secs(3)).await;
-            } else if slots_remaining > 20 {
-                // Getting closer
-                sleep(Duration::from_secs(1)).await;
+            } else if slots_remaining > 60 {
+                // Long wait, sleep moderately
+                sleep(Duration::from_secs(2)).await;
+            } else if slots_remaining > 30 {
+                // Getting closer, poll every 500ms
+                sleep(Duration::from_millis(500)).await;
             } else {
                 // Very close, poll faster
                 sleep(Duration::from_millis(50)).await;
