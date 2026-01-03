@@ -111,11 +111,11 @@ impl JitoClient {
         &self,
         transactions: Vec<Transaction>,
     ) -> Result<BundleResult> {
-        // Serialize transactions to base64
+        // Serialize transactions to base58 (Jito expects base58-encoded serialized tx bytes)
         let serialized_txs: Vec<String> = transactions.iter()
             .map(|tx| {
                 let bytes = bincode::serialize(tx).unwrap();
-                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
+                bs58::encode(&bytes).into_string()
             })
             .collect();
         
