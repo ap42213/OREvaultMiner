@@ -419,17 +419,29 @@ impl StrategyEngine {
     
     /// Wait until we're in the submission window (near end of round)
     async fn wait_for_submission_window(ore_client: &OreClient) -> Result<RoundState> {
+        let mut log_counter = 0u32;
         loop {
             let round = ore_client.get_current_round_state().await?;
             let slots_remaining = ore_client.get_slots_remaining().await.unwrap_or(0);
             
+            // Log every 10 iterations to avoid spam
+            log_counter += 1;
+            if log_counter % 10 == 1 {
+                debug!("Waiting for submission window: slots_remaining={}, round_id={}, total_deployed={}", 
+                    slots_remaining, round.round_id, round.total_deployed);
+            }
+            
             // Submit when ~5-10 slots remaining (about 2-4 seconds)
             if slots_remaining <= 10 && slots_remaining > 0 {
+                info!("Entering submission window: {} slots remaining", slots_remaining);
                 return Ok(round);
             }
             
             if slots_remaining == 0 {
                 // Round ended or waiting for first deploy, wait for next round
+                if log_counter % 10 == 1 {
+                    debug!("No active round (slots=0), waiting...");
+                }
                 sleep(Duration::from_secs(2)).await;
             } else if slots_remaining > 50 {
                 // Long wait, sleep longer
