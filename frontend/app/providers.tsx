@@ -2,12 +2,13 @@
 
 import { useEffect, useRef } from 'react';
 import { useOreVaultStore } from '@/lib/store';
-import { getMiningWallets, generateWallet } from '@/lib/api';
+import { getMiningWallets, generateWallet, getSessionStatus } from '@/lib/api';
 
 /**
  * App Providers
  * 
  * - Loads mining wallet from backend on mount
+ * - Checks for active mining session
  * - Establishes WebSocket connection for real-time updates
  * - No wallet-adapter needed (backend manages signing)
  */
@@ -18,6 +19,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
     setMiningWallet, 
     setMiningWalletLoading,
     setWsConnected,
+    setIsRunning,
     handleWsMessage 
   } = useOreVaultStore();
 
@@ -29,7 +31,19 @@ export function Providers({ children }: { children: React.ReactNode }) {
         
         if (wallets && wallets.length > 0) {
           // Use the first active wallet
-          setMiningWallet(wallets[0].wallet_address);
+          const walletAddress = wallets[0].wallet_address;
+          setMiningWallet(walletAddress);
+          
+          // Check if there's an active session
+          try {
+            const status = await getSessionStatus(walletAddress) as { active: boolean };
+            if (status.active) {
+              setIsRunning(true);
+            }
+          } catch (e) {
+            // Session status check failed, assume not running
+            console.log('Session status check failed:', e);
+          }
         } else {
           // No wallet exists, generate one
           console.log('No mining wallet found, generating...');
@@ -44,7 +58,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
     }
 
     loadWallet();
-  }, [setMiningWallet, setMiningWalletLoading]);
+  }, [setMiningWallet, setMiningWalletLoading, setIsRunning]);
 
   // WebSocket connection when wallet is loaded
   useEffect(() => {
