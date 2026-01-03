@@ -673,6 +673,20 @@ impl StrategyEngine {
             squares[block_index as usize] = true;
         }
         
+        // Ensure required automation + miner PDAs exist and are initialized.
+        // The deploy instruction requires the automation PDA; without this, ORE can fail with
+        // InvalidAccountData.
+        let automate_ix = ore_client.build_automate_instruction(
+            &wallet_pubkey,
+            deploy_amount,
+            0, // deposit
+            &wallet_pubkey, // executor
+            0, // fee
+            0, // mask
+            2, // Discretionary
+            false,
+        )?;
+
         // Build checkpoint instruction first - REQUIRED before deploy each round
         let checkpoint_ix = ore_client.build_checkpoint_instruction(
             &wallet_pubkey,
@@ -696,15 +710,15 @@ impl StrategyEngine {
         let blockhash = ore_client.get_latest_blockhash().await?;
         info!("Blockhash: {}", blockhash);
         
-        // Build bundle with checkpoint + deploy + tip
+        // Build bundle with automate + checkpoint + deploy + tip
         let mut tx = jito_client.build_bundle(
-            vec![checkpoint_ix, deploy_ix],
+            vec![automate_ix, checkpoint_ix, deploy_ix],
             &wallet_pubkey,
             tip_amount,
             blockhash,
         )?;
-        
-        info!("Transaction built with {} instructions (checkpoint + deploy + tip)", tx.message.instructions.len());
+
+        info!("Transaction built with {} instructions (automate + checkpoint + deploy + tip)", tx.message.instructions.len());
         
         // Check if we can sign server-side (automine)
         if let Some(ref wm) = wallet_manager {

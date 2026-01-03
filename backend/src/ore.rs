@@ -414,6 +414,33 @@ impl OreClient {
     ) -> Result<solana_sdk::instruction::Instruction> {
         Ok(ore_api::sdk::checkpoint(*signer, *authority, round_id))
     }
+
+    /// Build Automate instruction using ore-api SDK
+    ///
+    /// This initializes/updates the user's automation + miner PDAs which are
+    /// required by the ORE v3 deploy instruction.
+    pub fn build_automate_instruction(
+        &self,
+        signer: &Pubkey,
+        amount: u64,
+        deposit: u64,
+        executor: &Pubkey,
+        fee: u64,
+        mask: u64,
+        strategy: u8,
+        reload: bool,
+    ) -> Result<solana_sdk::instruction::Instruction> {
+        Ok(ore_api::sdk::automate(
+            *signer,
+            amount,
+            deposit,
+            *executor,
+            fee,
+            mask,
+            strategy,
+            reload,
+        ))
+    }
     
     /// Get time remaining in current round based on slots
     pub async fn get_slots_remaining(&self) -> Result<u64> {
