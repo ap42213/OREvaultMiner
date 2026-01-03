@@ -673,6 +673,14 @@ impl StrategyEngine {
             squares[block_index as usize] = true;
         }
         
+        // Build checkpoint instruction first - REQUIRED before deploy each round
+        let checkpoint_ix = ore_client.build_checkpoint_instruction(
+            &wallet_pubkey,
+            &wallet_pubkey,
+            board.round_id,
+        )?;
+        info!("Checkpoint instruction built for round {}", board.round_id);
+        
         // Build deploy instruction using ore-api SDK
         let deploy_ix = ore_client.build_deploy_instruction(
             &wallet_pubkey,
@@ -688,15 +696,15 @@ impl StrategyEngine {
         let blockhash = ore_client.get_latest_blockhash().await?;
         info!("Blockhash: {}", blockhash);
         
-        // Build bundle with tip
+        // Build bundle with checkpoint + deploy + tip
         let mut tx = jito_client.build_bundle(
-            vec![deploy_ix],
+            vec![checkpoint_ix, deploy_ix],
             &wallet_pubkey,
             tip_amount,
             blockhash,
         )?;
         
-        info!("Transaction built with {} instructions", tx.message.instructions.len());
+        info!("Transaction built with {} instructions (checkpoint + deploy + tip)", tx.message.instructions.len());
         
         // Check if we can sign server-side (automine)
         if let Some(ref wm) = wallet_manager {
