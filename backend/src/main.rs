@@ -206,7 +206,6 @@ pub struct StartSessionRequest {
     pub deploy_amount: f64,
     pub max_tip: f64,
     pub budget: f64,
-    pub signature: String, // Wallet signature for auth
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,7 +260,6 @@ async fn start_session(
 #[derive(Debug, Deserialize)]
 pub struct StopSessionRequest {
     pub wallet: String,
-    pub signature: String,
 }
 
 /// Stop a mining session
