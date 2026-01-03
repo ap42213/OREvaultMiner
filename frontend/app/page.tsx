@@ -1,15 +1,16 @@
 'use client';
 
-import { WalletConnect } from '@/components/WalletConnect';
+import { MiningWallet } from '@/components/MiningWallet';
 import { BalanceDisplay } from '@/components/BalanceDisplay';
 import { ClaimPanel } from '@/components/ClaimPanel';
 import { BetConfig } from '@/components/BetConfig';
+import { AiDecisions } from '@/components/AiDecisions';
 import { Stats } from '@/components/Stats';
 import { Grid } from '@/components/Grid';
-import { useWallet } from '@solana/wallet-adapter-react';
+import { useOreVaultStore } from '@/lib/store';
 
 export default function Home() {
-  const { connected } = useWallet();
+  const { miningWalletLoading } = useOreVaultStore();
 
   return (
     <main className="min-h-screen p-8">
@@ -19,17 +20,14 @@ export default function Home() {
           <h1 className="text-2xl font-bold">OreVault</h1>
           <p className="text-muted text-sm">Automated ORE v3 Mining</p>
         </div>
-        <WalletConnect />
+        <MiningWallet />
       </header>
 
-      {!connected ? (
+      {miningWalletLoading ? (
         <div className="flex flex-col items-center justify-center min-h-[60vh]">
           <div className="text-center">
-            <h2 className="text-xl mb-4">Connect Your Wallet</h2>
-            <p className="text-muted mb-6">
-              Connect with Phantom, Backpack, Solflare, or Hush to start mining
-            </p>
-            <WalletConnect />
+            <div className="w-8 h-8 border-2 border-primary border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+            <p className="text-muted">Loading mining wallet...</p>
           </div>
         </div>
       ) : (
@@ -46,8 +44,9 @@ export default function Home() {
             <Grid />
           </div>
 
-          {/* Right Column - Stats */}
-          <div>
+          {/* Right Column - AI & Stats */}
+          <div className="space-y-6">
+            <AiDecisions />
             <Stats />
           </div>
         </div>

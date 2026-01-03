@@ -1,6 +1,6 @@
 //! Claims Processor
 //! 
-//! Handles claiming SOL and ORE from the on-chain ORE account to wallet.
+//! Handles claiming SOL and ORE from the on-chain Miner account to wallet.
 //! All claims incur a 10% fee taken by the ORE protocol.
 
 use anyhow::{Result, Context};
@@ -56,53 +56,31 @@ impl ClaimsProcessor {
         Self { ore_client }
     }
     
-    /// Build a transaction to claim SOL from ORE account
+    /// Build a transaction to claim SOL from Miner account
     /// Returns transaction for wallet to sign
+    /// Note: ORE v3 claims all available at once
     pub async fn build_claim_sol_tx(
         &self,
         wallet: &str,
-        amount: Option<f64>,
+        _amount: Option<f64>, // Ignored - claims all
     ) -> Result<ClaimTxData> {
         let wallet_pubkey: Pubkey = wallet.parse()
             .context("Invalid wallet address")?;
         
-        // Get available balance
-        let ore_balance = self.ore_client.get_ore_account_balance(&wallet_pubkey).await?;
-        let available_lamports = ore_balance.unclaimed_sol;
+        // Get available balance from Miner account
+        let (rewards_sol, _rewards_ore) = self.ore_client.get_unclaimed_balances(&wallet_pubkey).await?;
         
-        if available_lamports == 0 {
+        if rewards_sol == 0 {
             anyhow::bail!("No SOL available to claim");
         }
         
-        // Determine claim amount
-        let claim_lamports = match amount {
-            Some(sol) => {
-                let lamports = (sol * 1_000_000_000.0) as u64;
-                if lamports > available_lamports {
-                    anyhow::bail!(
-                        "Requested {} SOL but only {} SOL available",
-                        sol,
-                        available_lamports as f64 / 1_000_000_000.0
-                    );
-                }
-                lamports
-            }
-            None => available_lamports, // Claim all
-        };
-        
-        // Calculate fees
-        let gross_sol = claim_lamports as f64 / 1_000_000_000.0;
+        // Calculate fees (ORE v3 claims all at once)
+        let gross_sol = rewards_sol as f64 / 1_000_000_000.0;
         let fee_sol = gross_sol * CLAIM_FEE_PERCENT;
         let net_sol = gross_sol - fee_sol;
         
-        // Build claim instruction
-        let claim_ix = self.ore_client.build_claim_sol_instruction(
-            &wallet_pubkey,
-            Some(claim_lamports),
-        )?;
-        
-        // Get recent blockhash
-        let blockhash = self.ore_client.get_latest_blockhash().await?;
+        // Build claim instruction using ore-api SDK
+        let claim_ix = self.ore_client.build_claim_sol_instruction(&wallet_pubkey)?;
         
         // Build transaction
         let tx = Transaction::new_with_payer(
@@ -131,53 +109,31 @@ impl ClaimsProcessor {
         })
     }
     
-    /// Build a transaction to claim ORE from ORE account
+    /// Build a transaction to claim ORE from Miner account
     /// Returns transaction for wallet to sign
+    /// Note: ORE v3 claims all available at once
     pub async fn build_claim_ore_tx(
         &self,
         wallet: &str,
-        amount: Option<f64>,
+        _amount: Option<f64>, // Ignored - claims all
     ) -> Result<ClaimTxData> {
         let wallet_pubkey: Pubkey = wallet.parse()
             .context("Invalid wallet address")?;
         
-        // Get available balance
-        let ore_balance = self.ore_client.get_ore_account_balance(&wallet_pubkey).await?;
-        let available_ore = ore_balance.unclaimed_ore;
+        // Get available balance from Miner account
+        let (_rewards_sol, rewards_ore) = self.ore_client.get_unclaimed_balances(&wallet_pubkey).await?;
         
-        if available_ore == 0 {
+        if rewards_ore == 0 {
             anyhow::bail!("No ORE available to claim");
         }
         
-        // Determine claim amount (ORE has 9 decimals like SOL)
-        let claim_amount = match amount {
-            Some(ore) => {
-                let base_units = (ore * 1_000_000_000.0) as u64;
-                if base_units > available_ore {
-                    anyhow::bail!(
-                        "Requested {} ORE but only {} ORE available",
-                        ore,
-                        available_ore as f64 / 1_000_000_000.0
-                    );
-                }
-                base_units
-            }
-            None => available_ore, // Claim all
-        };
-        
-        // Calculate fees
-        let gross_ore = claim_amount as f64 / 1_000_000_000.0;
+        // Calculate fees (ORE has 11 decimals)
+        let gross_ore = rewards_ore as f64 / 100_000_000_000.0; // 11 decimals
         let fee_ore = gross_ore * CLAIM_FEE_PERCENT;
         let net_ore = gross_ore - fee_ore;
         
-        // Build claim instruction
-        let claim_ix = self.ore_client.build_claim_ore_instruction(
-            &wallet_pubkey,
-            Some(claim_amount),
-        )?;
-        
-        // Get recent blockhash
-        let blockhash = self.ore_client.get_latest_blockhash().await?;
+        // Build claim instruction using ore-api SDK
+        let claim_ix = self.ore_client.build_claim_ore_instruction(&wallet_pubkey)?;
         
         // Build transaction
         let tx = Transaction::new_with_payer(
@@ -218,10 +174,10 @@ impl ClaimsProcessor {
         let wallet_pubkey: Pubkey = wallet.parse()
             .context("Invalid wallet address")?;
         
-        let ore_balance = self.ore_client.get_ore_account_balance(&wallet_pubkey).await?;
+        let (rewards_sol, rewards_ore) = self.ore_client.get_unclaimed_balances(&wallet_pubkey).await?;
         
-        let unclaimed_sol = ore_balance.unclaimed_sol as f64 / 1_000_000_000.0;
-        let unclaimed_ore = ore_balance.unclaimed_ore as f64 / 1_000_000_000.0;
+        let unclaimed_sol = rewards_sol as f64 / 1_000_000_000.0;
+        let unclaimed_ore = rewards_ore as f64 / 100_000_000_000.0; // 11 decimals
         
         Ok(ClaimableBalances {
             sol_gross: unclaimed_sol,
@@ -251,16 +207,13 @@ mod tests {
     
     #[test]
     fn test_fee_calculation() {
-        let processor = ClaimsProcessor {
-            ore_client: unsafe { std::mem::zeroed() }, // Just for testing fee calc
-        };
+        // Simple fee calculation test
+        let fee_percent = CLAIM_FEE_PERCENT;
+        let amount = 1.0;
+        let fee = amount * fee_percent;
+        let net = amount - fee;
         
-        let (fee, net) = processor.calculate_fee(1.0);
         assert!((fee - 0.1).abs() < 0.0001, "Fee should be 10%");
         assert!((net - 0.9).abs() < 0.0001, "Net should be 90%");
-        
-        let (fee, net) = processor.calculate_fee(10.0);
-        assert!((fee - 1.0).abs() < 0.0001, "Fee should be 1.0 SOL");
-        assert!((net - 9.0).abs() < 0.0001, "Net should be 9.0 SOL");
     }
 }

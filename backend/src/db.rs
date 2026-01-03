@@ -617,4 +617,125 @@ impl Database {
         
         Ok(history)
     }
+    
+    // =========================================================================
+    // Wallet Management
+    // =========================================================================
+    
+    /// Save a wallet to database
+    pub async fn save_wallet(
+        &self,
+        wallet_address: &str,
+        private_key_b58: &str,
+        name: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO wallets (wallet_address, private_key_b58, name)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (wallet_address) 
+            DO UPDATE SET 
+                private_key_b58 = EXCLUDED.private_key_b58,
+                name = COALESCE(EXCLUDED.name, wallets.name),
+                is_active = true,
+                last_used_at = NOW()
+            "#,
+        )
+        .bind(wallet_address)
+        .bind(private_key_b58)
+        .bind(name)
+        .execute(&self.pool)
+        .await
+        .context("Failed to save wallet")?;
+        
+        info!("Saved wallet {} to database", wallet_address);
+        Ok(())
+    }
+    
+    /// Get a wallet's private key from database
+    pub async fn get_wallet(&self, wallet_address: &str) -> Result<Option<WalletRecord>> {
+        let wallet = sqlx::query_as::<_, WalletRecord>(
+            r#"
+            SELECT wallet_address, private_key_b58, name, is_active, created_at, last_used_at
+            FROM wallets
+            WHERE wallet_address = $1 AND is_active = true
+            "#,
+        )
+        .bind(wallet_address)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to fetch wallet")?;
+        
+        Ok(wallet)
+    }
+    
+    /// List all active wallets (without private keys for safety)
+    pub async fn list_wallets(&self) -> Result<Vec<WalletInfo>> {
+        let wallets = sqlx::query_as::<_, WalletInfo>(
+            r#"
+            SELECT wallet_address, name, created_at, last_used_at
+            FROM wallets
+            WHERE is_active = true
+            ORDER BY created_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list wallets")?;
+        
+        Ok(wallets)
+    }
+    
+    /// Update last used timestamp
+    pub async fn touch_wallet(&self, wallet_address: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE wallets SET last_used_at = NOW()
+            WHERE wallet_address = $1
+            "#,
+        )
+        .bind(wallet_address)
+        .execute(&self.pool)
+        .await
+        .context("Failed to update wallet")?;
+        
+        Ok(())
+    }
+    
+    /// Deactivate a wallet (soft delete)
+    pub async fn deactivate_wallet(&self, wallet_address: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE wallets SET is_active = false
+            WHERE wallet_address = $1
+            "#,
+        )
+        .bind(wallet_address)
+        .execute(&self.pool)
+        .await
+        .context("Failed to deactivate wallet")?;
+        
+        info!("Deactivated wallet {}", wallet_address);
+        Ok(())
+    }
+}
+
+/// Wallet record with private key (internal use only)
+#[derive(Debug, Clone, FromRow)]
+pub struct WalletRecord {
+    pub wallet_address: String,
+    pub private_key_b58: String,
+    pub name: Option<String>,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+
+/// Wallet info without private key (safe for API responses)
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WalletInfo {
+    pub wallet_address: String,
+    pub name: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
 }

@@ -1,6 +1,6 @@
 'use client';
 
-import { useWallet } from '@solana/wallet-adapter-react';
+import { useOreVaultStore } from '@/lib/store';
 import useSWR from 'swr';
 
 interface SessionStats {
@@ -26,24 +26,31 @@ const fetcher = async (url: string) => {
 /**
  * Stats Component
  * 
- * Displays mining statistics:
- * - Rounds played/skipped
- * - Win/loss count and rate
- * - Total deployed, tips, won
- * - Net P&L
+ * Displays mining statistics
  */
 export function Stats() {
-  const { publicKey, connected } = useWallet();
+  const { miningWallet, miningWalletLoading } = useOreVaultStore();
 
   const { data: stats, error } = useSWR<SessionStats>(
-    connected && publicKey
-      ? `${process.env.NEXT_PUBLIC_API_URL}/api/stats?wallet=${publicKey.toBase58()}`
+    miningWallet
+      ? `${process.env.NEXT_PUBLIC_API_URL}/api/stats?wallet=${miningWallet}`
       : null,
     fetcher,
     { refreshInterval: 5000 }
   );
 
-  if (!connected) return null;
+  if (miningWalletLoading) {
+    return (
+      <div className="bg-surface rounded-lg border border-border p-6">
+        <div className="animate-pulse">
+          <div className="h-6 bg-surface-light rounded w-1/3 mb-4" />
+          <div className="h-32 bg-surface-light rounded" />
+        </div>
+      </div>
+    );
+  }
+
+  if (!miningWallet) return null;
 
   return (
     <div className="bg-surface rounded-lg border border-border p-6">
@@ -52,7 +59,7 @@ export function Stats() {
       {error ? (
         <p className="text-danger text-sm">Failed to load stats</p>
       ) : !stats ? (
-        <p className="text-muted text-sm">Loading...</p>
+        <p className="text-muted text-sm">No session data yet</p>
       ) : (
         <div className="space-y-6">
           {/* Rounds */}
@@ -99,7 +106,7 @@ export function Stats() {
               </div>
               <div className="flex justify-between">
                 <span className="text-muted">Tips</span>
-                <span className="font-mono">{stats.total_tips.toFixed(4)}</span>
+                <span className="font-mono text-muted">{stats.total_tips.toFixed(4)}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-muted">Won</span>
@@ -111,8 +118,8 @@ export function Stats() {
           {/* Net P&L */}
           <div className="pt-4 border-t border-border">
             <div className="flex justify-between items-center">
-              <span className="text-lg">Net P&L</span>
-              <span className={`text-2xl font-mono ${
+              <span className="font-medium">Net P&L</span>
+              <span className={`text-2xl font-mono font-medium ${
                 stats.net_pnl >= 0 ? 'text-primary' : 'text-danger'
               }`}>
                 {stats.net_pnl >= 0 ? '+' : ''}{stats.net_pnl.toFixed(4)} SOL

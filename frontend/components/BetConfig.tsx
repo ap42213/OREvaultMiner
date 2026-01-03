@@ -1,7 +1,8 @@
 'use client';
 
 import { useState } from 'react';
-import { useWallet } from '@solana/wallet-adapter-react';
+import { useOreVaultStore } from '@/lib/store';
+import { startSession, stopSession } from '@/lib/api';
 
 type Strategy = 'best_ev' | 'conservative' | 'aggressive';
 
@@ -20,53 +21,54 @@ interface BetConfigState {
  * - Deploy amount per round
  * - Maximum tip for Jito
  * - Total budget limit
+ * 
+ * No wallet signing needed - backend handles everything
  */
 export function BetConfig() {
-  const { publicKey, connected, signMessage } = useWallet();
+  const { miningWallet, miningWalletLoading, isRunning, setIsRunning } = useOreVaultStore();
   const [config, setConfig] = useState<BetConfigState>({
     strategy: 'best_ev',
     deployAmount: '0.1',
     maxTip: '0.001',
     budget: '1.0',
   });
-  const [isRunning, setIsRunning] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  if (!connected) return null;
+  if (miningWalletLoading) {
+    return (
+      <div className="bg-surface rounded-lg border border-border p-6">
+        <div className="animate-pulse">
+          <div className="h-6 bg-surface-light rounded w-1/3 mb-4" />
+          <div className="h-10 bg-surface-light rounded mb-4" />
+          <div className="h-10 bg-surface-light rounded mb-4" />
+          <div className="h-10 bg-surface-light rounded" />
+        </div>
+      </div>
+    );
+  }
+
+  if (!miningWallet) {
+    return (
+      <div className="bg-surface rounded-lg border border-border p-6">
+        <h2 className="text-lg font-semibold mb-4">Mining Configuration</h2>
+        <p className="text-muted">No mining wallet configured.</p>
+      </div>
+    );
+  }
 
   const handleStart = async () => {
-    if (!publicKey || !signMessage) return;
-    
     setLoading(true);
     setError(null);
 
     try {
-      // Sign message for authentication
-      const message = new TextEncoder().encode(
-        `OreVault: Start mining session at ${Date.now()}`
-      );
-      const signature = await signMessage(message);
-      const signatureBase64 = Buffer.from(signature).toString('base64');
-
-      // Start session
-      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/session/start`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          wallet: publicKey.toBase58(),
-          strategy: config.strategy,
-          deploy_amount: parseFloat(config.deployAmount),
-          max_tip: parseFloat(config.maxTip),
-          budget: parseFloat(config.budget),
-          signature: signatureBase64,
-        }),
+      await startSession({
+        wallet: miningWallet,
+        strategy: config.strategy,
+        deploy_amount: parseFloat(config.deployAmount),
+        max_tip: parseFloat(config.maxTip),
+        budget: parseFloat(config.budget),
       });
-
-      const data = await response.json();
-      if (!data.success) {
-        throw new Error(data.error || 'Failed to start session');
-      }
 
       setIsRunning(true);
     } catch (e: any) {
@@ -77,32 +79,11 @@ export function BetConfig() {
   };
 
   const handleStop = async () => {
-    if (!publicKey || !signMessage) return;
-
     setLoading(true);
     setError(null);
 
     try {
-      const message = new TextEncoder().encode(
-        `OreVault: Stop mining session at ${Date.now()}`
-      );
-      const signature = await signMessage(message);
-      const signatureBase64 = Buffer.from(signature).toString('base64');
-
-      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/session/stop`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          wallet: publicKey.toBase58(),
-          signature: signatureBase64,
-        }),
-      });
-
-      const data = await response.json();
-      if (!data.success) {
-        throw new Error(data.error || 'Failed to stop session');
-      }
-
+      await stopSession({ wallet: miningWallet });
       setIsRunning(false);
     } catch (e: any) {
       setError(e.message || 'Failed to stop');

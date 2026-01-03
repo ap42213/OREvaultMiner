@@ -30,6 +30,15 @@ pub enum WsEvent {
         blocks: Vec<BlockInfo>,
     },
     
+    /// AI analysis result
+    #[serde(rename = "ai:analysis")]
+    AiAnalysis {
+        selected_block: u8,
+        confidence: f64,
+        reasoning: String,
+        skip: bool,
+    },
+    
     /// Decision made (deploy or skip)
     #[serde(rename = "decision:made")]
     DecisionMade {
@@ -37,6 +46,14 @@ pub enum WsEvent {
         block: Option<u8>,
         ev: f64,
         reason: Option<String>,
+    },
+    
+    /// Transaction submitted
+    #[serde(rename = "tx:submitted")]
+    TxSubmitted {
+        signature: String,
+        block: u8,
+        amount: f64,
     },
     
     /// Transaction confirmed
@@ -210,6 +227,7 @@ pub async fn handle_socket(
             // Only forward events for this client's wallet
             let target_wallet = match &event {
                 StrategyEvent::RoundUpdate { wallet, .. } => wallet,
+                StrategyEvent::AiAnalysis { wallet, .. } => wallet,
                 StrategyEvent::DecisionMade { wallet, .. } => wallet,
                 StrategyEvent::TxSubmitted { wallet, .. } => wallet,
                 StrategyEvent::TxConfirmed { wallet, .. } => wallet,
@@ -354,6 +372,14 @@ fn convert_strategy_event(event: StrategyEvent) -> WsEvent {
                 }).collect(),
             }
         }
+        StrategyEvent::AiAnalysis { selected_block, confidence, reasoning, skip, .. } => {
+            WsEvent::AiAnalysis {
+                selected_block,
+                confidence,
+                reasoning,
+                skip,
+            }
+        }
         StrategyEvent::DecisionMade { decision, .. } => {
             match decision {
                 crate::strategy::RoundDecision::Deploy { block_index, expected_ev, .. } => {
@@ -375,10 +401,10 @@ fn convert_strategy_event(event: StrategyEvent) -> WsEvent {
             }
         }
         StrategyEvent::TxSubmitted { signature, block_index, amount, .. } => {
-            WsEvent::TxConfirmed {
+            WsEvent::TxSubmitted {
                 signature,
-                status: "submitted".to_string(),
-                reward: None,
+                block: block_index,
+                amount: amount as f64 / 1_000_000_000.0,
             }
         }
         StrategyEvent::TxConfirmed { signature, status, reward, .. } => {

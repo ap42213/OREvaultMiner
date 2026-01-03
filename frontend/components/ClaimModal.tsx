@@ -1,13 +1,13 @@
 'use client';
 
 import { useState } from 'react';
-import { useWallet, useConnection } from '@solana/wallet-adapter-react';
-import { Transaction } from '@solana/web3.js';
+import { claimSol, claimOre } from '@/lib/api';
 
 interface ClaimModalProps {
   isOpen: boolean;
   onClose: () => void;
   claimType: 'sol' | 'ore';
+  wallet: string;
   grossAmount: number;
   netAmount: number;
   onSuccess: () => void;
@@ -16,24 +16,18 @@ interface ClaimModalProps {
 /**
  * ClaimModal Component
  * 
- * Confirmation modal for claiming SOL or ORE with fee breakdown:
- * 
- * CLAIM SOL
- * Available:    0.850 SOL
- * Fee (10%):   -0.085 SOL
- * You receive:  0.765 SOL
- * [Cancel] [Confirm]
+ * Confirmation modal for claiming SOL or ORE with fee breakdown.
+ * Backend handles signing with the mining wallet.
  */
 export function ClaimModal({ 
   isOpen, 
   onClose, 
   claimType, 
+  wallet,
   grossAmount, 
   netAmount,
   onSuccess 
 }: ClaimModalProps) {
-  const { publicKey, signTransaction } = useWallet();
-  const { connection } = useConnection();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -43,53 +37,18 @@ export function ClaimModal({
   const symbol = claimType.toUpperCase();
 
   const handleClaim = async () => {
-    if (!publicKey || !signTransaction) {
-      setError('Wallet not connected');
-      return;
-    }
-
     setLoading(true);
     setError(null);
 
     try {
-      // 1. Get claim transaction from backend
-      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/claim/${claimType}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          wallet: publicKey.toBase58(),
-          amount: null, // Claim all
-        }),
-      });
-
-      const data = await response.json();
-      if (!data.success) {
-        throw new Error(data.error || 'Failed to build transaction');
+      // Backend handles signing with the mining wallet
+      if (claimType === 'sol') {
+        await claimSol(wallet);
+      } else {
+        await claimOre(wallet);
       }
 
-      // 2. Deserialize transaction
-      const txBuffer = Buffer.from(data.transaction, 'base64');
-      const transaction = Transaction.from(txBuffer);
-
-      // 3. Get latest blockhash
-      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = publicKey;
-
-      // 4. Sign with wallet
-      const signedTx = await signTransaction(transaction);
-
-      // 5. Send transaction
-      const signature = await connection.sendRawTransaction(signedTx.serialize());
-
-      // 6. Confirm transaction
-      await connection.confirmTransaction({
-        signature,
-        blockhash,
-        lastValidBlockHeight,
-      });
-
-      console.log(`Claim ${symbol} confirmed:`, signature);
+      console.log(`Claim ${symbol} submitted`);
       onSuccess();
 
     } catch (e: any) {
@@ -126,9 +85,9 @@ export function ClaimModal({
               -{feeAmount.toFixed(claimType === 'sol' ? 4 : 2)} {symbol}
             </span>
           </div>
-          <div className="border-t border-border pt-3 flex justify-between text-lg font-semibold">
-            <span>You receive</span>
-            <span className="font-mono text-primary">
+          <div className="border-t border-border pt-3 flex justify-between">
+            <span className="font-medium">You receive</span>
+            <span className="font-mono text-primary font-medium">
               {netAmount.toFixed(claimType === 'sol' ? 4 : 2)} {symbol}
             </span>
           </div>
@@ -144,18 +103,23 @@ export function ClaimModal({
           <button
             onClick={onClose}
             disabled={loading}
-            className="flex-1 py-2 px-4 bg-surface-light hover:bg-border rounded-lg transition-colors disabled:opacity-50"
+            className="flex-1 py-3 px-4 rounded-lg bg-surface-light hover:bg-border text-white font-medium transition-colors disabled:opacity-50"
           >
             Cancel
           </button>
           <button
             onClick={handleClaim}
-            disabled={loading}
-            className="flex-1 py-2 px-4 bg-primary hover:bg-primary/80 text-black font-medium rounded-lg transition-colors disabled:opacity-50"
+            disabled={loading || netAmount <= 0}
+            className="flex-1 py-3 px-4 rounded-lg bg-primary hover:bg-primary/80 text-black font-medium transition-colors disabled:opacity-50"
           >
             {loading ? 'Claiming...' : 'Confirm'}
           </button>
         </div>
+
+        {/* Note */}
+        <p className="text-xs text-muted mt-4 text-center">
+          Claim will be signed by the mining wallet
+        </p>
       </div>
     </div>
   );

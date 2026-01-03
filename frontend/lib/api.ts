@@ -29,14 +29,49 @@ async function fetchApi<T>(
   return data;
 }
 
-// Session API
+// =========================================================================
+// Wallet Management API
+// =========================================================================
+
+export interface WalletInfo {
+  wallet_address: string;
+  name: string | null;
+  created_at: string;
+  last_used_at: string | null;
+}
+
+export async function getMiningWallets(): Promise<{ wallets: WalletInfo[] }> {
+  return fetchApi('/api/wallet/list');
+}
+
+export async function generateWallet(): Promise<{ wallet_address: string }> {
+  return fetchApi('/api/wallet/generate', { method: 'POST' });
+}
+
+export async function importWallet(privateKey: string): Promise<{ wallet_address: string }> {
+  return fetchApi('/api/wallet/import', {
+    method: 'POST',
+    body: JSON.stringify({ private_key: privateKey }),
+  });
+}
+
+export async function exportWallet(walletAddress: string): Promise<{ private_key: string }> {
+  return fetchApi('/api/wallet/export', {
+    method: 'POST',
+    body: JSON.stringify({ wallet_address: walletAddress }),
+  });
+}
+
+// =========================================================================
+// Session API (no wallet signing needed)
+// =========================================================================
+
 export async function startSession(params: {
   wallet: string;
   strategy: string;
   deploy_amount: number;
   max_tip: number;
   budget: number;
-  signature: string;
 }) {
   return fetchApi('/api/session/start', {
     method: 'POST',
@@ -44,15 +79,20 @@ export async function startSession(params: {
   });
 }
 
-export async function stopSession(params: {
-  wallet: string;
-  signature: string;
-}) {
+export async function stopSession(params: { wallet: string }) {
   return fetchApi('/api/session/stop', {
     method: 'POST',
     body: JSON.stringify(params),
   });
 }
+
+export async function getSessionStatus(wallet: string) {
+  return fetchApi(`/api/session/status?wallet=${wallet}`);
+}
+
+// =========================================================================
+// Stats API
+// =========================================================================
 
 export async function getStats(wallet: string) {
   return fetchApi(`/api/stats?wallet=${wallet}`);
@@ -68,7 +108,10 @@ export async function getTransactions(
   );
 }
 
+// =========================================================================
 // Balance API
+// =========================================================================
+
 export async function getBalances(wallet: string) {
   return fetchApi(`/api/balances?wallet=${wallet}`);
 }
@@ -80,7 +123,10 @@ export async function syncBalances(wallet: string) {
   });
 }
 
+// =========================================================================
 // Claims API
+// =========================================================================
+
 export async function claimSol(wallet: string, amount?: number) {
   return fetchApi('/api/claim/sol', {
     method: 'POST',

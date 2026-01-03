@@ -1,69 +1,32 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { useWallet } from '@solana/wallet-adapter-react';
-
-interface BlockData {
-  index: number;
-  total_deployed: number;
-  ev: number;
-}
-
-interface RoundData {
-  round_id: number;
-  time_left: number;
-  blocks: BlockData[];
-}
+import { useState } from 'react';
+import { useOreVaultStore } from '@/lib/store';
 
 /**
  * Grid Component
  * 
- * Optional 5x5 grid visualization showing:
+ * 5x5 grid visualization showing:
  * - All 25 blocks
  * - SOL deployed per block
  * - EV indicator (green = positive, red = negative)
+ * - AI selected block highlighted
  */
 export function Grid() {
-  const { publicKey, connected } = useWallet();
-  const [roundData, setRoundData] = useState<RoundData | null>(null);
+  const { round, decision, miningWallet, isRunning } = useOreVaultStore();
   const [selectedBlock, setSelectedBlock] = useState<number | null>(null);
-  const [showGrid, setShowGrid] = useState(false);
+  const [showGrid, setShowGrid] = useState(true);
 
-  // WebSocket connection for real-time updates
-  useEffect(() => {
-    if (!connected || !publicKey) return;
-
-    const wsUrl = `${process.env.NEXT_PUBLIC_WS_URL}?wallet=${publicKey.toBase58()}`;
-    const ws = new WebSocket(wsUrl);
-
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type === 'round:update') {
-          setRoundData(data.payload);
-        }
-      } catch (e) {
-        console.error('WS parse error:', e);
-      }
-    };
-
-    ws.onerror = (error) => {
-      console.error('WebSocket error:', error);
-    };
-
-    return () => {
-      ws.close();
-    };
-  }, [connected, publicKey]);
-
-  if (!connected) return null;
+  if (!miningWallet) return null;
 
   // Generate empty blocks if no data
-  const blocks: BlockData[] = roundData?.blocks || Array.from({ length: 25 }, (_, i) => ({
-    index: i,
-    total_deployed: 0,
-    ev: 0,
-  }));
+  const blocks = round.blocks.length > 0 
+    ? round.blocks 
+    : Array.from({ length: 25 }, (_, i) => ({
+        index: i,
+        total_deployed: 0,
+        ev: 0,
+      }));
 
   // Find max for scaling
   const maxDeployed = Math.max(...blocks.map(b => b.total_deployed), 0.001);
@@ -81,23 +44,27 @@ export function Grid() {
       </div>
 
       {/* Round Timer */}
-      {roundData && (
+      {round.roundId && (
         <div className="mb-4">
           <div className="flex justify-between text-sm">
-            <span className="text-muted">Round #{roundData.round_id}</span>
-            <span className={`font-mono ${roundData.time_left <= 5 ? 'text-warning' : ''}`}>
-              {roundData.time_left.toFixed(1)}s
+            <span className="text-muted">Round #{round.roundId}</span>
+            <span className={`font-mono ${round.timeLeft <= 5 ? 'text-warning' : ''}`}>
+              {round.timeLeft.toFixed(1)}s
             </span>
           </div>
           <div className="w-full bg-surface-light rounded-full h-1.5 mt-2">
             <div
               className={`h-1.5 rounded-full transition-all ${
-                roundData.time_left <= 5 ? 'bg-warning' : 'bg-primary'
+                round.timeLeft <= 5 ? 'bg-warning' : 'bg-primary'
               }`}
-              style={{ width: `${(roundData.time_left / 60) * 100}%` }}
+              style={{ width: `${(round.timeLeft / 60) * 100}%` }}
             />
           </div>
         </div>
+      )}
+
+      {!isRunning && !round.roundId && (
+        <p className="text-muted text-sm mb-4">Start mining to see round data</p>
       )}
 
       {showGrid && (
@@ -108,15 +75,17 @@ export function Grid() {
               const intensity = block.total_deployed / maxDeployed;
               const isPositiveEv = block.ev > 0;
               const isSelected = selectedBlock === block.index;
+              const isAiChoice = decision.block === block.index;
 
               return (
                 <button
                   key={block.index}
                   onClick={() => setSelectedBlock(isSelected ? null : block.index)}
                   className={`
-                    aspect-square rounded transition-all
+                    aspect-square rounded transition-all relative
                     flex flex-col items-center justify-center text-xs
                     ${isSelected ? 'ring-2 ring-white' : ''}
+                    ${isAiChoice ? 'ring-2 ring-primary' : ''}
                     ${isPositiveEv ? 'bg-primary/20 hover:bg-primary/30' : 'bg-danger/20 hover:bg-danger/30'}
                   `}
                   style={{
@@ -129,53 +98,53 @@ export function Grid() {
                       {block.total_deployed.toFixed(2)}
                     </span>
                   )}
+                  {isAiChoice && (
+                    <div className="absolute -top-1 -right-1 w-2 h-2 bg-primary rounded-full" />
+                  )}
                 </button>
               );
             })}
           </div>
 
+          {/* Legend */}
+          <div className="mt-4 flex items-center gap-4 text-xs text-muted">
+            <div className="flex items-center gap-1">
+              <div className="w-3 h-3 bg-primary/30 rounded" />
+              <span>+EV</span>
+            </div>
+            <div className="flex items-center gap-1">
+              <div className="w-3 h-3 bg-danger/30 rounded" />
+              <span>-EV</span>
+            </div>
+            <div className="flex items-center gap-1">
+              <div className="w-2 h-2 bg-primary rounded-full" />
+              <span>AI Pick</span>
+            </div>
+          </div>
+
           {/* Selected Block Details */}
-          {selectedBlock !== null && (
+          {selectedBlock !== null && blocks[selectedBlock] && (
             <div className="mt-4 p-3 bg-surface-light rounded-lg">
               <h4 className="font-medium mb-2">Block {selectedBlock}</h4>
               <div className="grid grid-cols-2 gap-2 text-sm">
                 <div>
                   <span className="text-muted">Deployed:</span>
                   <span className="font-mono ml-2">
-                    {blocks[selectedBlock]?.total_deployed.toFixed(4)} SOL
+                    {blocks[selectedBlock].total_deployed.toFixed(4)} SOL
                   </span>
                 </div>
                 <div>
                   <span className="text-muted">EV:</span>
                   <span className={`font-mono ml-2 ${
-                    blocks[selectedBlock]?.ev >= 0 ? 'text-primary' : 'text-danger'
+                    blocks[selectedBlock].ev > 0 ? 'text-primary' : 'text-danger'
                   }`}>
-                    {blocks[selectedBlock]?.ev >= 0 ? '+' : ''}
-                    {blocks[selectedBlock]?.ev.toFixed(4)} SOL
+                    {blocks[selectedBlock].ev > 0 ? '+' : ''}{blocks[selectedBlock].ev.toFixed(4)}
                   </span>
                 </div>
               </div>
             </div>
           )}
-
-          {/* Legend */}
-          <div className="mt-4 flex justify-center gap-6 text-xs text-muted">
-            <div className="flex items-center gap-2">
-              <div className="w-3 h-3 bg-primary/50 rounded" />
-              <span>Positive EV</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <div className="w-3 h-3 bg-danger/50 rounded" />
-              <span>Negative EV</span>
-            </div>
-          </div>
         </>
-      )}
-
-      {!showGrid && (
-        <p className="text-sm text-muted">
-          Click Show to view real-time block data
-        </p>
       )}
     </div>
   );

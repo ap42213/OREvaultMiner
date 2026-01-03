@@ -9,12 +9,14 @@ use std::sync::Arc;
 
 use anyhow::{Result, Context};
 use tokio::sync::{broadcast, RwLock};
-use tokio::time::{Duration, interval, sleep};
+use tokio::time::{Duration, sleep};
 use tracing::{debug, info, warn, error};
 use uuid::Uuid;
 
+use crate::ai::{AiStrategy, GridState};
 use crate::ore::{OreClient, BlockData, RoundState};
 use crate::jito::JitoClient;
+use crate::wallet::WalletManager;
 use crate::Strategy;
 
 /// Round decision result
@@ -69,6 +71,8 @@ struct ActiveSession {
 pub struct StrategyEngine {
     ore_client: OreClient,
     jito_client: JitoClient,
+    ai_strategy: Option<AiStrategy>,
+    wallet_manager: Option<Arc<WalletManager>>,
     active_sessions: HashMap<String, ActiveSession>,
     event_tx: broadcast::Sender<StrategyEvent>,
 }
@@ -81,6 +85,14 @@ pub enum StrategyEvent {
         round_id: u64,
         time_left: f64,
         blocks: Vec<BlockEv>,
+    },
+    /// AI analysis result
+    AiAnalysis {
+        wallet: String,
+        selected_block: u8,
+        confidence: f64,
+        reasoning: String,
+        skip: bool,
     },
     DecisionMade {
         wallet: String,
@@ -108,9 +120,21 @@ impl StrategyEngine {
         Self {
             ore_client,
             jito_client,
+            ai_strategy: None,
+            wallet_manager: None,
             active_sessions: HashMap::new(),
             event_tx,
         }
+    }
+    
+    /// Set wallet manager for server-side signing (automine)
+    pub fn set_wallet_manager(&mut self, wm: Arc<WalletManager>) {
+        self.wallet_manager = Some(wm);
+    }
+    
+    /// Set the AI strategy for intelligent block selection
+    pub fn set_ai_strategy(&mut self, ai: AiStrategy) {
+        self.ai_strategy = Some(ai);
     }
     
     /// Subscribe to strategy events
@@ -159,13 +183,17 @@ impl StrategyEngine {
         let ore_client = self.ore_client.clone();
         let jito_client = self.jito_client.clone();
         let event_tx = self.event_tx.clone();
-        let mut cancel_rx = cancel_tx.subscribe();
+        let ai_strategy = self.ai_strategy.clone();
+        let wallet_manager = self.wallet_manager.clone();
+        let cancel_rx = cancel_tx.subscribe();
         
         tokio::spawn(async move {
             Self::mining_loop(
                 config,
                 ore_client,
                 jito_client,
+                ai_strategy,
+                wallet_manager,
                 event_tx,
                 cancel_rx,
             ).await;
@@ -188,10 +216,25 @@ impl StrategyEngine {
         config: SessionConfig,
         ore_client: OreClient,
         jito_client: JitoClient,
+        ai_strategy: Option<AiStrategy>,
+        wallet_manager: Option<Arc<WalletManager>>,
         event_tx: broadcast::Sender<StrategyEvent>,
         mut cancel_rx: broadcast::Receiver<()>,
     ) {
         info!("Mining loop started for wallet {}", config.wallet);
+        
+        // Check if we have signing capability
+        let can_sign = if let Some(ref wm) = wallet_manager {
+            wm.has_keypair(&config.wallet).await
+        } else {
+            false
+        };
+        
+        if !can_sign {
+            warn!("No keypair found for {} - transactions will require frontend signing", config.wallet);
+        } else {
+            info!("Automine enabled - server-side signing for {}", config.wallet);
+        }
         
         loop {
             // Check for cancellation
@@ -200,7 +243,10 @@ impl StrategyEngine {
                 break;
             }
             
-            // Wait for submission window (T-2.0s)
+            // PHASE 1: No pre-caching needed - Gemini Flash gives ~750ms real-time decisions
+            // We'll query AI at T-2s when we have the latest state
+            
+            // PHASE 2: Wait for final submission window (T-2.0s)
             match Self::wait_for_submission_window(&ore_client).await {
                 Ok(round) => {
                     // Snapshot all blocks at T-2.0s
@@ -218,28 +264,100 @@ impl StrategyEngine {
                     
                     let block_evs = Self::calculate_all_ev(
                         &blocks,
-                        round.total_pot,
+                        round.total_deployed,
                         config.deploy_amount,
                         tip_cost,
                     );
                     
-                    // Emit round update event
+                    // Emit round update event - convert slots to approximate seconds (400ms per slot)
+                    let slots_left = if round.end_slot > round.start_slot { 
+                        ore_client.get_slots_remaining().await.unwrap_or(0) 
+                    } else { 0 };
+                    let time_left = slots_left as f64 * 0.4; // ~400ms per slot
+                    
                     let _ = event_tx.send(StrategyEvent::RoundUpdate {
                         wallet: config.wallet.clone(),
                         round_id: round.round_id,
-                        time_left: (round.end_time - chrono::Utc::now().timestamp()) as f64,
+                        time_left,
                         blocks: block_evs.clone(),
                     });
                     
-                    // Make GO/NO-GO decision at T-1.6s
-                    sleep(Duration::from_millis(200)).await;
-                    
-                    let decision = Self::make_decision(
-                        &block_evs,
-                        &config.strategy,
-                        config.deploy_amount,
-                        tip_cost,
-                    );
+                    // PHASE 3: Real-time AI decision using Gemini Flash (~750ms) at T-2s
+                    // AI finds lowest stake blocks, skips if all equal
+                    let decision = if let Some(ref ai) = ai_strategy {
+                        // Build grid state for AI
+                        let slots_left = ore_client.get_slots_remaining().await.unwrap_or(0);
+                        let grid = crate::ai::GridState {
+                            deployed: blocks.iter().map(|b| b.total_deployed).collect(),
+                            miner_counts: blocks.iter().map(|b| b.miner_count).collect(),
+                            total_pot: round.total_deployed,
+                            round_id: round.round_id,
+                            slots_remaining: slots_left,
+                            deploy_amount: config.deploy_amount,
+                            tip_cost,
+                        };
+                        
+                        let strategy_hint = match config.strategy {
+                            Strategy::BestEv => "best_ev",
+                            Strategy::Conservative => "conservative",
+                            Strategy::Aggressive => "aggressive",
+                        };
+                        
+                        // Real-time AI call - Gemini Flash responds in ~750ms
+                        let start = std::time::Instant::now();
+                        match ai.select_blocks(&grid, 1, strategy_hint).await {
+                            Ok(selection) => {
+                                info!("AI decision in {}ms: skip={}, blocks={:?}, confidence={:.2}", 
+                                    start.elapsed().as_millis(), selection.skip, selection.blocks, selection.confidence);
+                                
+                                // Emit AI analysis event for frontend
+                                let _ = event_tx.send(StrategyEvent::AiAnalysis {
+                                    wallet: config.wallet.clone(),
+                                    selected_block: selection.blocks.first().copied().unwrap_or(255),
+                                    confidence: selection.confidence,
+                                    reasoning: selection.reasoning.clone(),
+                                    skip: selection.skip,
+                                });
+                                
+                                // Check if AI says to skip this round
+                                if selection.skip {
+                                    info!("AI SKIP: {}", selection.reasoning);
+                                    RoundDecision::Skip {
+                                        reason: selection.reasoning,
+                                        best_ev: 0.0,
+                                    }
+                                } else if selection.blocks.is_empty() {
+                                    RoundDecision::Skip {
+                                        reason: "AI returned no blocks".to_string(),
+                                        best_ev: 0.0,
+                                    }
+                                } else {
+                                    // Use AI's lowest-stake block selection
+                                    let block_idx = selection.blocks[0];
+                                    let block_ev = block_evs.iter()
+                                        .find(|b| b.index == block_idx)
+                                        .map(|b| b.ev)
+                                        .unwrap_or(0.0);
+                                    
+                                    info!("AI selected block {} (lowest stake) - reason: {}", 
+                                        block_idx, selection.reasoning);
+                                    RoundDecision::Deploy {
+                                        block_index: block_idx,
+                                        expected_ev: block_ev,
+                                        deploy_amount: config.deploy_amount,
+                                        tip_amount: tip_cost,
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("AI failed ({}ms): {}, using fallback", start.elapsed().as_millis(), e);
+                                Self::make_decision(&block_evs, &config.strategy, config.deploy_amount, tip_cost)
+                            }
+                        }
+                    } else {
+                        // No AI - use fast EV calculation
+                        Self::make_decision(&block_evs, &config.strategy, config.deploy_amount, tip_cost)
+                    };
                     
                     // Emit decision event
                     let _ = event_tx.send(StrategyEvent::DecisionMade {
@@ -256,6 +374,7 @@ impl StrategyEngine {
                             match Self::submit_deploy(
                                 &ore_client,
                                 &jito_client,
+                                &wallet_manager,
                                 &config.wallet,
                                 block_index,
                                 deploy_amount,
@@ -298,21 +417,21 @@ impl StrategyEngine {
         }
     }
     
-    /// Wait until we're in the submission window (T-2.0s to T-0.0s)
+    /// Wait until we're in the submission window (near end of round)
     async fn wait_for_submission_window(ore_client: &OreClient) -> Result<RoundState> {
         loop {
-            let round = ore_client.get_round_state().await?;
-            let now = chrono::Utc::now().timestamp();
-            let time_remaining = (round.end_time - now) as f64;
+            let round = ore_client.get_current_round_state().await?;
+            let slots_remaining = ore_client.get_slots_remaining().await.unwrap_or(0);
             
-            if time_remaining <= 2.0 && time_remaining > 0.0 {
+            // Submit when ~5-10 slots remaining (about 2-4 seconds)
+            if slots_remaining <= 10 && slots_remaining > 0 {
                 return Ok(round);
             }
             
-            if time_remaining <= 0.0 {
-                // Round ended, wait for next round
+            if slots_remaining == 0 {
+                // Round ended or waiting for first deploy, wait for next round
                 sleep(Duration::from_secs(2)).await;
-            } else if time_remaining > 10.0 {
+            } else if slots_remaining > 50 {
                 // Long wait, sleep longer
                 sleep(Duration::from_secs(5)).await;
             } else {
@@ -422,10 +541,97 @@ impl StrategyEngine {
         }
     }
     
+    /// Make AI-powered decision using OpenRouter/Intellect 3
+    async fn make_ai_decision(
+        ai: &AiStrategy,
+        blocks: &[BlockData; 25],
+        round: &RoundState,
+        slots_remaining: u64,
+        strategy: &Strategy,
+        deploy_amount: u64,
+        tip_cost: u64,
+    ) -> RoundDecision {
+        // Build grid state for AI
+        let grid = GridState {
+            deployed: blocks.iter().map(|b| b.total_deployed).collect(),
+            miner_counts: blocks.iter().map(|b| b.miner_count).collect(),
+            total_pot: round.total_deployed,
+            round_id: round.round_id,
+            slots_remaining,
+            deploy_amount,
+            tip_cost,
+        };
+        
+        let strategy_hint = match strategy {
+            Strategy::BestEv => "best_ev",
+            Strategy::Conservative => "conservative",
+            Strategy::Aggressive => "aggressive",
+        };
+        
+        // Get AI selection (1 block for now)
+        match ai.select_blocks(&grid, 1, strategy_hint).await {
+            Ok(selection) if !selection.blocks.is_empty() => {
+                let block_index = selection.blocks[0];
+                
+                // Calculate EV for the selected block
+                let block_deployed = blocks[block_index as usize].total_deployed;
+                let new_total = block_deployed + deploy_amount;
+                let win_probability = if new_total > 0 {
+                    deploy_amount as f64 / new_total as f64
+                } else {
+                    1.0
+                };
+                let other_squares_pot = round.total_deployed.saturating_sub(block_deployed);
+                let expected_winnings = win_probability * other_squares_pot as f64;
+                let ev = expected_winnings * 0.04 - tip_cost as f64;
+                let ev_sol = ev / 1_000_000_000.0;
+                
+                // If confidence is low or EV is very negative, skip
+                if selection.confidence < 0.3 || ev_sol < -0.1 {
+                    info!("AI selected block {} but confidence low ({:.2}) or EV too negative ({:.6})", 
+                        block_index, selection.confidence, ev_sol);
+                    return RoundDecision::Skip {
+                        reason: format!("AI confidence too low: {:.2}", selection.confidence),
+                        best_ev: ev_sol,
+                    };
+                }
+                
+                info!("AI selected block {} with confidence {:.2}: {}", 
+                    block_index, selection.confidence, selection.reasoning);
+                
+                RoundDecision::Deploy {
+                    block_index,
+                    expected_ev: ev_sol,
+                    deploy_amount,
+                    tip_amount: tip_cost,
+                }
+            }
+            Ok(_) => {
+                warn!("AI returned no block selections");
+                RoundDecision::Skip {
+                    reason: "AI found no viable blocks".to_string(),
+                    best_ev: 0.0,
+                }
+            }
+            Err(e) => {
+                warn!("AI selection failed, using fallback: {}", e);
+                // Fall back to best EV calculation
+                let block_evs: Vec<_> = blocks.iter().map(|block| {
+                    Self::calculate_block_ev(block, round.total_deployed, deploy_amount, tip_cost)
+                }).collect();
+                
+                Self::make_decision(&block_evs, strategy, deploy_amount, tip_cost)
+            }
+        }
+    }
+    
     /// Submit deploy transaction via Jito
+    /// If wallet_manager has the keypair, sign server-side (automine)
+    /// Otherwise, return unsigned for frontend signing
     async fn submit_deploy(
         ore_client: &OreClient,
         jito_client: &JitoClient,
+        wallet_manager: &Option<Arc<WalletManager>>,
         wallet: &str,
         block_index: u8,
         deploy_amount: u64,
@@ -434,34 +640,58 @@ impl StrategyEngine {
         let wallet_pubkey: solana_sdk::pubkey::Pubkey = wallet.parse()
             .context("Invalid wallet address")?;
         
-        // Build deploy instruction
+        // Get current round ID from board
+        let board = ore_client.get_board_state().await?;
+        
+        // Build squares array - only the selected block is true
+        let mut squares = [false; 25];
+        if block_index < 25 {
+            squares[block_index as usize] = true;
+        }
+        
+        // Build deploy instruction using ore-api SDK
         let deploy_ix = ore_client.build_deploy_instruction(
             &wallet_pubkey,
-            block_index,
+            &wallet_pubkey, // authority is same as signer for user deploys
             deploy_amount,
+            board.round_id,
+            squares,
         )?;
         
         // Get recent blockhash
         let blockhash = ore_client.get_latest_blockhash().await?;
         
         // Build bundle with tip
-        let tx = jito_client.build_bundle(
+        let mut tx = jito_client.build_bundle(
             vec![deploy_ix],
             &wallet_pubkey,
             tip_amount,
             blockhash,
         )?;
         
-        // Note: Transaction needs to be signed by wallet
-        // This is handled by the frontend - we return the unsigned tx
-        // The actual flow is:
-        // 1. Backend builds tx
-        // 2. Frontend receives tx and signs with wallet
-        // 3. Frontend sends signed tx back
-        // 4. Backend submits via Jito
+        // Check if we can sign server-side (automine)
+        if let Some(ref wm) = wallet_manager {
+            if wm.has_keypair(wallet).await {
+                // Server-side signing - automine mode!
+                tx.message.recent_blockhash = blockhash;
+                wm.sign_transaction(wallet, &mut tx).await
+                    .context("Failed to sign transaction")?;
+                
+                info!("Signed transaction server-side for automine");
+                
+                // Submit via Jito
+                let result = jito_client.send_bundle(vec![tx]).await
+                    .context("Failed to submit bundle to Jito")?;
+                
+                info!("Bundle submitted to Jito: {}", result.bundle_id);
+                
+                // Return the bundle ID as signature placeholder
+                return Ok(result.bundle_id);
+            }
+        }
         
-        // For now, return a placeholder
-        // In production, this would coordinate with the WebSocket
+        // No keypair available - need frontend signing
+        warn!("No keypair for {} - transaction requires frontend signing", wallet);
         Ok(format!("pending_signature_{}", uuid::Uuid::new_v4()))
     }
 }
@@ -475,7 +705,7 @@ mod tests {
         let block = BlockData {
             index: 0,
             total_deployed: 1_000_000_000, // 1 SOL
-            deployers: vec![],
+            miner_count: 5,
         };
         
         let total_pot = 10_000_000_000; // 10 SOL

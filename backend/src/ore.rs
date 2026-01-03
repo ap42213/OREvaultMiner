@@ -1,75 +1,79 @@
 //! ORE v3 Program Client
 //! 
 //! Handles all interactions with the ORE v3 program on Solana mainnet.
-//! Program ID: oreV3EG1i9BEgiAJ8b177Z2S2rMarzak4NMv1kULvWv
+//! Using ore-api crate for correct PDAs and account structures.
 
-use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{Result, Context};
-use solana_client::rpc_client::RpcClient;
+use ore_api::state::{board_pda, round_pda, miner_pda, treasury_pda};
 use solana_client::nonblocking::rpc_client::RpcClient as AsyncRpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
-    instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     signature::Signature,
     transaction::Transaction,
-    system_program,
-    sysvar,
 };
 use tracing::{debug, info, warn};
 
 /// ORE v3 Program ID on Mainnet
-pub const ORE_PROGRAM_ID: &str = "oreV3EG1i9BEgiAJ8b177Z2S2rMarzak4NMv1kULvWv";
+pub const ORE_PROGRAM_ID: Pubkey = ore_api::ID;
 
-/// ORE v3 Instruction discriminators
-#[repr(u8)]
-pub enum OreInstruction {
-    Deploy = 0,
-    Reset = 1,
-    ClaimOre = 2,
-    ClaimSol = 3,
-    Checkpoint = 4,
-}
-
-/// Block data from ORE grid (5x5 = 25 blocks)
+/// Block data from ORE grid (5x5 = 25 squares)
 #[derive(Debug, Clone)]
 pub struct BlockData {
     pub index: u8,
     pub total_deployed: u64,
-    pub deployers: Vec<DeployerData>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DeployerData {
-    pub wallet: Pubkey,
-    pub amount: u64,
+    pub miner_count: u64,
 }
 
 /// Round state from on-chain
 #[derive(Debug, Clone)]
 pub struct RoundState {
     pub round_id: u64,
-    pub start_time: i64,
-    pub end_time: i64,
-    pub total_pot: u64,
+    pub start_slot: u64,
+    pub end_slot: u64,
+    pub expires_at: u64,
+    pub total_deployed: u64,
+    pub total_vaulted: u64,
+    pub total_winnings: u64,
+    pub total_miners: u64,
+    pub motherlode: u64,
+    pub top_miner: Pubkey,
     pub blocks: [BlockData; 25],
+    pub slot_hash: [u8; 32],
 }
 
-/// User's ORE account balances (on-chain, unclaimed)
+/// Board state (current round info)
+#[derive(Debug, Clone)]
+pub struct BoardState {
+    pub round_id: u64,
+    pub start_slot: u64,
+    pub end_slot: u64,
+    pub epoch_id: u64,
+}
+
+/// User's Miner account data
 #[derive(Debug, Clone, Default)]
-pub struct OreAccountBalance {
-    pub unclaimed_sol: u64,   // lamports
-    pub unclaimed_ore: u64,   // base units
-    pub refined_ore: u64,     // base units
+pub struct MinerData {
+    pub authority: Pubkey,
+    pub deployed: [u64; 25],
+    pub cumulative: [u64; 25],
+    pub checkpoint_fee: u64,
+    pub checkpoint_id: u64,
+    pub rewards_sol: u64,
+    pub rewards_ore: u64,
+    pub refined_ore: u64,
+    pub round_id: u64,
+    pub lifetime_rewards_sol: u64,
+    pub lifetime_rewards_ore: u64,
+    pub lifetime_deployed: u64,
 }
 
 /// ORE v3 client for interacting with the program
 #[derive(Clone)]
 pub struct OreClient {
     rpc: Arc<AsyncRpcClient>,
-    program_id: Pubkey,
 }
 
 impl OreClient {
@@ -80,40 +84,158 @@ impl OreClient {
             CommitmentConfig::confirmed(),
         ));
         
-        let program_id = Pubkey::from_str(ORE_PROGRAM_ID)
-            .context("Invalid ORE program ID")?;
+        info!("ORE Client initialized for program: {}", ORE_PROGRAM_ID);
         
-        info!("ORE Client initialized for program: {}", program_id);
-        
-        Ok(Self { rpc, program_id })
+        Ok(Self { rpc })
     }
     
     /// Get the ORE program ID
-    pub fn program_id(&self) -> &Pubkey {
-        &self.program_id
+    pub fn program_id(&self) -> Pubkey {
+        ORE_PROGRAM_ID
     }
     
-    /// Get current round state from on-chain
-    pub async fn get_round_state(&self) -> Result<RoundState> {
-        // Derive the round PDA
-        let (round_pda, _bump) = Pubkey::find_program_address(
-            &[b"round"],
-            &self.program_id,
-        );
+    /// Get current board state (tells us current round_id)
+    pub async fn get_board_state(&self) -> Result<BoardState> {
+        let (board_address, _) = board_pda();
         
-        let account = self.rpc.get_account(&round_pda).await
-            .context("Failed to fetch round account")?;
+        let account = self.rpc.get_account(&board_address).await
+            .context("Failed to fetch board account")?;
         
-        // Parse round account data
-        // The actual parsing depends on ore-api's account structure
-        let round_state = self.parse_round_account(&account.data)?;
+        // Parse board account - ore-api uses first 8 bytes as discriminator
+        let data = &account.data;
+        if data.len() < 8 + 32 {
+            anyhow::bail!("Board account data too short: {} bytes", data.len());
+        }
         
-        Ok(round_state)
+        // Skip 8-byte discriminator
+        let board_data = &data[8..];
+        
+        let round_id = u64::from_le_bytes(board_data[0..8].try_into()?);
+        let start_slot = u64::from_le_bytes(board_data[8..16].try_into()?);
+        let end_slot = u64::from_le_bytes(board_data[16..24].try_into()?);
+        let epoch_id = u64::from_le_bytes(board_data[24..32].try_into()?);
+        
+        debug!("Board state: round_id={}, start_slot={}, end_slot={}", round_id, start_slot, end_slot);
+        
+        Ok(BoardState {
+            round_id,
+            start_slot,
+            end_slot,
+            epoch_id,
+        })
+    }
+    
+    /// Get round state for a specific round ID
+    pub async fn get_round_state(&self, round_id: u64) -> Result<RoundState> {
+        let (round_address, _) = round_pda(round_id);
+        
+        let account = self.rpc.get_account(&round_address).await
+            .context(format!("Failed to fetch round {} account", round_id))?;
+        
+        let data = &account.data;
+        if data.len() < 8 {
+            anyhow::bail!("Round account data too short");
+        }
+        
+        // Skip 8-byte discriminator
+        let round_data = &data[8..];
+        
+        // Parse Round struct fields based on ore-api/src/state/round.rs
+        let mut offset = 0;
+        
+        // id: u64
+        let id = u64::from_le_bytes(round_data[offset..offset+8].try_into()?);
+        offset += 8;
+        
+        // deployed: [u64; 25]
+        let mut deployed = [0u64; 25];
+        for i in 0..25 {
+            deployed[i] = u64::from_le_bytes(round_data[offset..offset+8].try_into()?);
+            offset += 8;
+        }
+        
+        // slot_hash: [u8; 32]
+        let mut slot_hash = [0u8; 32];
+        slot_hash.copy_from_slice(&round_data[offset..offset+32]);
+        offset += 32;
+        
+        // count: [u64; 25]
+        let mut count = [0u64; 25];
+        for i in 0..25 {
+            count[i] = u64::from_le_bytes(round_data[offset..offset+8].try_into()?);
+            offset += 8;
+        }
+        
+        // expires_at: u64
+        let expires_at = u64::from_le_bytes(round_data[offset..offset+8].try_into()?);
+        offset += 8;
+        
+        // motherlode: u64
+        let motherlode = u64::from_le_bytes(round_data[offset..offset+8].try_into()?);
+        offset += 8;
+        
+        // rent_payer: Pubkey (32 bytes)
+        offset += 32;
+        
+        // top_miner: Pubkey
+        let top_miner = Pubkey::try_from(&round_data[offset..offset+32])?;
+        offset += 32;
+        
+        // top_miner_reward: u64
+        offset += 8;
+        
+        // total_deployed: u64
+        let total_deployed = u64::from_le_bytes(round_data[offset..offset+8].try_into()?);
+        offset += 8;
+        
+        // total_miners: u64
+        let total_miners = u64::from_le_bytes(round_data[offset..offset+8].try_into()?);
+        offset += 8;
+        
+        // total_vaulted: u64
+        let total_vaulted = u64::from_le_bytes(round_data[offset..offset+8].try_into()?);
+        offset += 8;
+        
+        // total_winnings: u64
+        let total_winnings = u64::from_le_bytes(round_data[offset..offset+8].try_into()?);
+        
+        // Build blocks array
+        let blocks: [BlockData; 25] = std::array::from_fn(|i| BlockData {
+            index: i as u8,
+            total_deployed: deployed[i],
+            miner_count: count[i],
+        });
+        
+        debug!("Round {} state: total_deployed={}, total_miners={}", id, total_deployed, total_miners);
+        
+        Ok(RoundState {
+            round_id: id,
+            start_slot: 0, // Get from board
+            end_slot: 0,   // Get from board
+            expires_at,
+            total_deployed,
+            total_vaulted,
+            total_winnings,
+            total_miners,
+            motherlode,
+            top_miner,
+            blocks,
+            slot_hash,
+        })
+    }
+    
+    /// Get current round state (fetches board first to get round_id)
+    pub async fn get_current_round_state(&self) -> Result<RoundState> {
+        let board = self.get_board_state().await?;
+        let mut round = self.get_round_state(board.round_id).await?;
+        round.start_slot = board.start_slot;
+        round.end_slot = board.end_slot;
+        Ok(round)
     }
     
     /// Get all 25 blocks for current round
     pub async fn get_all_blocks(&self) -> Result<[BlockData; 25]> {
-        let round = self.get_round_state().await?;
+        let round = self.get_current_round_state().await?;
         Ok(round.blocks)
     }
     
@@ -123,27 +245,111 @@ impl OreClient {
             anyhow::bail!("Block index must be 0-24, got {}", index);
         }
         
-        let round = self.get_round_state().await?;
+        let round = self.get_current_round_state().await?;
         Ok(round.blocks[index as usize].clone())
     }
     
-    /// Get user's ORE account balance (unclaimed rewards)
-    pub async fn get_ore_account_balance(&self, wallet: &Pubkey) -> Result<OreAccountBalance> {
-        // Derive user's ORE account PDA
-        let (user_account_pda, _bump) = Pubkey::find_program_address(
-            &[b"user", wallet.as_ref()],
-            &self.program_id,
-        );
+    /// Get user's Miner account data
+    pub async fn get_miner_data(&self, wallet: &Pubkey) -> Result<Option<MinerData>> {
+        let (miner_address, _) = miner_pda(*wallet);
         
-        match self.rpc.get_account(&user_account_pda).await {
+        match self.rpc.get_account(&miner_address).await {
             Ok(account) => {
-                let balance = self.parse_user_account(&account.data)?;
-                Ok(balance)
+                let data = &account.data;
+                if data.len() < 8 {
+                    return Ok(None);
+                }
+                
+                // Skip 8-byte discriminator
+                let miner_data = &data[8..];
+                let mut offset = 0;
+                
+                // authority: Pubkey
+                let authority = Pubkey::try_from(&miner_data[offset..offset+32])?;
+                offset += 32;
+                
+                // deployed: [u64; 25]
+                let mut deployed = [0u64; 25];
+                for i in 0..25 {
+                    deployed[i] = u64::from_le_bytes(miner_data[offset..offset+8].try_into()?);
+                    offset += 8;
+                }
+                
+                // cumulative: [u64; 25]
+                let mut cumulative = [0u64; 25];
+                for i in 0..25 {
+                    cumulative[i] = u64::from_le_bytes(miner_data[offset..offset+8].try_into()?);
+                    offset += 8;
+                }
+                
+                // checkpoint_fee: u64
+                let checkpoint_fee = u64::from_le_bytes(miner_data[offset..offset+8].try_into()?);
+                offset += 8;
+                
+                // checkpoint_id: u64
+                let checkpoint_id = u64::from_le_bytes(miner_data[offset..offset+8].try_into()?);
+                offset += 8;
+                
+                // last_claim_ore_at: i64
+                offset += 8;
+                
+                // last_claim_sol_at: i64
+                offset += 8;
+                
+                // rewards_factor: Numeric (16 bytes)
+                offset += 16;
+                
+                // rewards_sol: u64
+                let rewards_sol = u64::from_le_bytes(miner_data[offset..offset+8].try_into()?);
+                offset += 8;
+                
+                // rewards_ore: u64
+                let rewards_ore = u64::from_le_bytes(miner_data[offset..offset+8].try_into()?);
+                offset += 8;
+                
+                // refined_ore: u64
+                let refined_ore = u64::from_le_bytes(miner_data[offset..offset+8].try_into()?);
+                offset += 8;
+                
+                // round_id: u64
+                let round_id = u64::from_le_bytes(miner_data[offset..offset+8].try_into()?);
+                offset += 8;
+                
+                // lifetime_rewards_sol: u64
+                let lifetime_rewards_sol = u64::from_le_bytes(miner_data[offset..offset+8].try_into()?);
+                offset += 8;
+                
+                // lifetime_rewards_ore: u64
+                let lifetime_rewards_ore = u64::from_le_bytes(miner_data[offset..offset+8].try_into()?);
+                offset += 8;
+                
+                // lifetime_deployed: u64
+                let lifetime_deployed = u64::from_le_bytes(miner_data[offset..offset+8].try_into()?);
+                
+                Ok(Some(MinerData {
+                    authority,
+                    deployed,
+                    cumulative,
+                    checkpoint_fee,
+                    checkpoint_id,
+                    rewards_sol,
+                    rewards_ore,
+                    refined_ore,
+                    round_id,
+                    lifetime_rewards_sol,
+                    lifetime_rewards_ore,
+                    lifetime_deployed,
+                }))
             }
-            Err(_) => {
-                // Account doesn't exist yet - user hasn't played
-                Ok(OreAccountBalance::default())
-            }
+            Err(_) => Ok(None), // Account doesn't exist
+        }
+    }
+    
+    /// Get user's unclaimed balances from Miner account
+    pub async fn get_unclaimed_balances(&self, wallet: &Pubkey) -> Result<(u64, u64)> {
+        match self.get_miner_data(wallet).await? {
+            Some(miner) => Ok((miner.rewards_sol, miner.rewards_ore)),
+            None => Ok((0, 0)),
         }
     }
     
@@ -156,7 +362,7 @@ impl OreClient {
     
     /// Get wallet ORE token balance
     pub async fn get_ore_token_balance(&self, wallet: &Pubkey) -> Result<u64> {
-        let ore_mint = self.get_ore_mint();
+        let ore_mint = ore_api::consts::MINT_ADDRESS;
         let ata = spl_associated_token_account::get_associated_token_address(
             wallet,
             &ore_mint,
@@ -164,252 +370,68 @@ impl OreClient {
         
         match self.rpc.get_token_account_balance(&ata).await {
             Ok(balance) => {
-                let amount = balance.amount.parse::<u64>()
-                    .unwrap_or(0);
+                let amount = balance.amount.parse::<u64>().unwrap_or(0);
                 Ok(amount)
             }
             Err(_) => Ok(0),
         }
     }
     
-    /// Get ORE token mint address
-    pub fn get_ore_mint(&self) -> Pubkey {
-        // ORE token mint - this should be fetched from ore-api
-        // For now using a placeholder that would need to be verified
-        Pubkey::find_program_address(
-            &[b"mint"],
-            &self.program_id,
-        ).0
-    }
-    
-    /// Build Deploy instruction
+    /// Build Deploy instruction using ore-api SDK
     pub fn build_deploy_instruction(
         &self,
-        wallet: &Pubkey,
-        block_index: u8,
+        signer: &Pubkey,
+        authority: &Pubkey,
         amount: u64,
-    ) -> Result<Instruction> {
-        if block_index >= 25 {
-            anyhow::bail!("Block index must be 0-24");
-        }
-        
-        let (round_pda, _) = Pubkey::find_program_address(
-            &[b"round"],
-            &self.program_id,
-        );
-        
-        let (block_pda, _) = Pubkey::find_program_address(
-            &[b"block", &[block_index]],
-            &self.program_id,
-        );
-        
-        let (user_account_pda, _) = Pubkey::find_program_address(
-            &[b"user", wallet.as_ref()],
-            &self.program_id,
-        );
-        
-        // Instruction data: [discriminator, block_index, amount (8 bytes)]
-        let mut data = vec![OreInstruction::Deploy as u8, block_index];
-        data.extend_from_slice(&amount.to_le_bytes());
-        
-        let accounts = vec![
-            AccountMeta::new(*wallet, true),           // payer/signer
-            AccountMeta::new(round_pda, false),        // round account
-            AccountMeta::new(block_pda, false),        // block account
-            AccountMeta::new(user_account_pda, false), // user account
-            AccountMeta::new_readonly(system_program::id(), false),
-        ];
-        
-        Ok(Instruction {
-            program_id: self.program_id,
-            accounts,
-            data,
-        })
+        round_id: u64,
+        squares: [bool; 25],
+    ) -> Result<solana_sdk::instruction::Instruction> {
+        Ok(ore_api::sdk::deploy(*signer, *authority, amount, round_id, squares))
     }
     
-    /// Build ClaimSOL instruction (10% fee applied on-chain)
+    /// Build ClaimSol instruction using ore-api SDK
     pub fn build_claim_sol_instruction(
         &self,
-        wallet: &Pubkey,
-        amount: Option<u64>, // None = claim all
-    ) -> Result<Instruction> {
-        let (user_account_pda, _) = Pubkey::find_program_address(
-            &[b"user", wallet.as_ref()],
-            &self.program_id,
-        );
-        
-        let (treasury_pda, _) = Pubkey::find_program_address(
-            &[b"treasury"],
-            &self.program_id,
-        );
-        
-        // Instruction data: [discriminator, amount (optional)]
-        let mut data = vec![OreInstruction::ClaimSol as u8];
-        if let Some(amt) = amount {
-            data.extend_from_slice(&amt.to_le_bytes());
-        }
-        
-        let accounts = vec![
-            AccountMeta::new(*wallet, true),           // wallet/signer
-            AccountMeta::new(user_account_pda, false), // user account
-            AccountMeta::new(treasury_pda, false),     // treasury (for fee)
-            AccountMeta::new_readonly(system_program::id(), false),
-        ];
-        
-        Ok(Instruction {
-            program_id: self.program_id,
-            accounts,
-            data,
-        })
+        signer: &Pubkey,
+    ) -> Result<solana_sdk::instruction::Instruction> {
+        Ok(ore_api::sdk::claim_sol(*signer))
     }
     
-    /// Build ClaimORE instruction (10% fee applied on-chain)
+    /// Build ClaimOre instruction using ore-api SDK
     pub fn build_claim_ore_instruction(
         &self,
-        wallet: &Pubkey,
-        amount: Option<u64>, // None = claim all
-    ) -> Result<Instruction> {
-        let ore_mint = self.get_ore_mint();
-        
-        let (user_account_pda, _) = Pubkey::find_program_address(
-            &[b"user", wallet.as_ref()],
-            &self.program_id,
-        );
-        
-        let (treasury_pda, _) = Pubkey::find_program_address(
-            &[b"treasury"],
-            &self.program_id,
-        );
-        
-        let wallet_ata = spl_associated_token_account::get_associated_token_address(
-            wallet,
-            &ore_mint,
-        );
-        
-        let treasury_ata = spl_associated_token_account::get_associated_token_address(
-            &treasury_pda,
-            &ore_mint,
-        );
-        
-        // Instruction data: [discriminator, amount (optional)]
-        let mut data = vec![OreInstruction::ClaimOre as u8];
-        if let Some(amt) = amount {
-            data.extend_from_slice(&amt.to_le_bytes());
-        }
-        
-        let accounts = vec![
-            AccountMeta::new(*wallet, true),           // wallet/signer
-            AccountMeta::new(user_account_pda, false), // user account
-            AccountMeta::new(ore_mint, false),         // ore mint
-            AccountMeta::new(wallet_ata, false),       // wallet token account
-            AccountMeta::new(treasury_ata, false),     // treasury token account (for fee)
-            AccountMeta::new_readonly(spl_token::id(), false),
-            AccountMeta::new_readonly(spl_associated_token_account::id(), false),
-            AccountMeta::new_readonly(system_program::id(), false),
-        ];
-        
-        Ok(Instruction {
-            program_id: self.program_id,
-            accounts,
-            data,
-        })
+        signer: &Pubkey,
+    ) -> Result<solana_sdk::instruction::Instruction> {
+        Ok(ore_api::sdk::claim_ore(*signer))
     }
     
-    /// Build Checkpoint instruction
+    /// Build Checkpoint instruction using ore-api SDK
     pub fn build_checkpoint_instruction(
         &self,
-        wallet: &Pubkey,
-    ) -> Result<Instruction> {
-        let (user_account_pda, _) = Pubkey::find_program_address(
-            &[b"user", wallet.as_ref()],
-            &self.program_id,
-        );
-        
-        let (round_pda, _) = Pubkey::find_program_address(
-            &[b"round"],
-            &self.program_id,
-        );
-        
-        let data = vec![OreInstruction::Checkpoint as u8];
-        
-        let accounts = vec![
-            AccountMeta::new(*wallet, true),
-            AccountMeta::new(user_account_pda, false),
-            AccountMeta::new_readonly(round_pda, false),
-        ];
-        
-        Ok(Instruction {
-            program_id: self.program_id,
-            accounts,
-            data,
-        })
+        signer: &Pubkey,
+        authority: &Pubkey,
+        round_id: u64,
+    ) -> Result<solana_sdk::instruction::Instruction> {
+        Ok(ore_api::sdk::checkpoint(*signer, *authority, round_id))
     }
     
-    /// Get time remaining in current round (seconds)
-    pub async fn get_time_remaining(&self) -> Result<f64> {
-        let round = self.get_round_state().await?;
-        let now = chrono::Utc::now().timestamp();
-        let remaining = (round.end_time - now) as f64;
-        Ok(remaining.max(0.0))
+    /// Get time remaining in current round based on slots
+    pub async fn get_slots_remaining(&self) -> Result<u64> {
+        let board = self.get_board_state().await?;
+        let current_slot = self.rpc.get_slot().await?;
+        
+        if current_slot >= board.end_slot || board.end_slot == u64::MAX {
+            Ok(0)
+        } else {
+            Ok(board.end_slot - current_slot)
+        }
     }
     
-    /// Check if we're in the submission window (T-2.0s to T-0.0s)
+    /// Check if we're in the submission window (near end of round)
     pub async fn in_submission_window(&self) -> Result<bool> {
-        let remaining = self.get_time_remaining().await?;
-        Ok(remaining <= 2.0 && remaining > 0.0)
-    }
-    
-    // Private parsing methods
-    
-    fn parse_round_account(&self, data: &[u8]) -> Result<RoundState> {
-        // This would use ore-api types for proper deserialization
-        // Placeholder implementation - actual implementation depends on ore-api structure
-        
-        if data.len() < 32 {
-            anyhow::bail!("Round account data too short");
-        }
-        
-        // Parse header
-        let round_id = u64::from_le_bytes(data[0..8].try_into()?);
-        let start_time = i64::from_le_bytes(data[8..16].try_into()?);
-        let end_time = i64::from_le_bytes(data[16..24].try_into()?);
-        let total_pot = u64::from_le_bytes(data[24..32].try_into()?);
-        
-        // Initialize empty blocks
-        let blocks: [BlockData; 25] = std::array::from_fn(|i| BlockData {
-            index: i as u8,
-            total_deployed: 0,
-            deployers: vec![],
-        });
-        
-        // TODO: Parse actual block data from account
-        
-        Ok(RoundState {
-            round_id,
-            start_time,
-            end_time,
-            total_pot,
-            blocks,
-        })
-    }
-    
-    fn parse_user_account(&self, data: &[u8]) -> Result<OreAccountBalance> {
-        // Parse user account data structure
-        // This depends on ore-api's actual account layout
-        
-        if data.len() < 24 {
-            return Ok(OreAccountBalance::default());
-        }
-        
-        let unclaimed_sol = u64::from_le_bytes(data[0..8].try_into()?);
-        let unclaimed_ore = u64::from_le_bytes(data[8..16].try_into()?);
-        let refined_ore = u64::from_le_bytes(data[16..24].try_into()?);
-        
-        Ok(OreAccountBalance {
-            unclaimed_sol,
-            unclaimed_ore,
-            refined_ore,
-        })
+        let slots_remaining = self.get_slots_remaining().await?;
+        // ORE rounds are ~150 slots, submit in last ~10 slots
+        Ok(slots_remaining <= 10 && slots_remaining > 0)
     }
     
     /// Get the RPC client for direct access
@@ -430,15 +452,35 @@ impl OreClient {
             .context("Failed to send transaction")?;
         Ok(sig)
     }
+    
+    /// Get current slot
+    pub async fn get_slot(&self) -> Result<u64> {
+        let slot = self.rpc.get_slot().await
+            .context("Failed to get current slot")?;
+        Ok(slot)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
     
     #[test]
     fn test_program_id() {
-        let pubkey = Pubkey::from_str(ORE_PROGRAM_ID).unwrap();
-        assert_eq!(pubkey.to_string(), ORE_PROGRAM_ID);
+        assert_eq!(ORE_PROGRAM_ID.to_string(), "oreV3EG1i9BEgiAJ8b177Z2S2rMarzak4NMv1kULvWv");
+    }
+    
+    #[test]
+    fn test_pdas() {
+        let (board, _) = board_pda();
+        println!("Board PDA: {}", board);
+        
+        let (round, _) = round_pda(1);
+        println!("Round 1 PDA: {}", round);
+        
+        let wallet = Pubkey::from_str("11111111111111111111111111111111").unwrap();
+        let (miner, _) = miner_pda(wallet);
+        println!("Miner PDA: {}", miner);
     }
 }

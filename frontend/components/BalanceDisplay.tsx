@@ -1,7 +1,7 @@
 'use client';
 
-import { useEffect, useState } from 'react';
-import { useWallet } from '@solana/wallet-adapter-react';
+import { useState } from 'react';
+import { useOreVaultStore } from '@/lib/store';
 import useSWR from 'swr';
 
 interface Balances {
@@ -32,33 +32,28 @@ const fetcher = async (url: string) => {
 /**
  * BalanceDisplay Component
  * 
- * Shows wallet AND unclaimed ORE account balances:
- * 
- * WALLET                 IN ACCOUNT (Unclaimed)
- * 2.500 SOL              0.850 SOL  [Claim]
- * 150.0 ORE              42.50 ORE  [Claim]
- *                        3.20 Refined ORE
+ * Shows wallet AND unclaimed ORE account balances
  */
 export function BalanceDisplay() {
-  const { publicKey, connected } = useWallet();
+  const { miningWallet, miningWalletLoading } = useOreVaultStore();
   const [syncing, setSyncing] = useState(false);
 
   const { data, error, mutate } = useSWR<Balances>(
-    connected && publicKey 
-      ? `${process.env.NEXT_PUBLIC_API_URL}/api/balances?wallet=${publicKey.toBase58()}`
+    miningWallet 
+      ? `${process.env.NEXT_PUBLIC_API_URL}/api/balances?wallet=${miningWallet}`
       : null,
     fetcher,
     { refreshInterval: 10000 }
   );
 
   const handleSync = async () => {
-    if (!publicKey) return;
+    if (!miningWallet) return;
     setSyncing(true);
     try {
       await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/balances/sync`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ wallet: publicKey.toBase58() }),
+        body: JSON.stringify({ wallet: miningWallet }),
       });
       mutate();
     } catch (e) {
@@ -68,7 +63,18 @@ export function BalanceDisplay() {
     }
   };
 
-  if (!connected) return null;
+  if (miningWalletLoading) {
+    return (
+      <div className="bg-surface rounded-lg border border-border p-6">
+        <div className="animate-pulse">
+          <div className="h-6 bg-surface-light rounded w-1/3 mb-4" />
+          <div className="h-20 bg-surface-light rounded" />
+        </div>
+      </div>
+    );
+  }
+
+  if (!miningWallet) return null;
 
   const balances = data as Balances | undefined;
 

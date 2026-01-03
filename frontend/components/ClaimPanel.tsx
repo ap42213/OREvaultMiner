@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { useWallet } from '@solana/wallet-adapter-react';
+import { useOreVaultStore } from '@/lib/store';
 import { ClaimModal } from './ClaimModal';
 import useSWR from 'swr';
 
@@ -28,23 +28,23 @@ const fetcher = async (url: string) => {
 /**
  * ClaimPanel Component
  * 
- * Allows users to claim SOL or ORE from their ORE account.
+ * Allows claiming SOL or ORE from the mining account.
  * Shows 10% fee preview before claiming.
  */
 export function ClaimPanel() {
-  const { publicKey, connected, signTransaction } = useWallet();
+  const { miningWallet, miningWalletLoading } = useOreVaultStore();
   const [claimType, setClaimType] = useState<'sol' | 'ore' | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
 
   const { data, mutate } = useSWR<ClaimableBalances>(
-    connected && publicKey
-      ? `${process.env.NEXT_PUBLIC_API_URL}/api/balances?wallet=${publicKey.toBase58()}`
+    miningWallet
+      ? `${process.env.NEXT_PUBLIC_API_URL}/api/balances?wallet=${miningWallet}`
       : null,
     fetcher,
     { refreshInterval: 10000 }
   );
 
-  if (!connected || !data) return null;
+  if (miningWalletLoading || !miningWallet || !data) return null;
 
   const balances = data as ClaimableBalances;
   const hasClaimableSol = balances.unclaimed.sol > 0;
@@ -61,7 +61,7 @@ export function ClaimPanel() {
         <h2 className="text-lg font-semibold mb-4">Claim Rewards</h2>
         
         <p className="text-sm text-muted mb-4">
-          Claim your unclaimed rewards from your ORE account. A 10% fee is applied to all claims.
+          Claim your mining rewards from the ORE account.
         </p>
 
         <div className="space-y-3">
@@ -103,7 +103,7 @@ export function ClaimPanel() {
       </div>
 
       {/* Claim Modal */}
-      {claimType && (
+      {claimType && miningWallet && (
         <ClaimModal
           isOpen={isModalOpen}
           onClose={() => {
@@ -111,6 +111,7 @@ export function ClaimPanel() {
             setClaimType(null);
           }}
           claimType={claimType}
+          wallet={miningWallet}
           grossAmount={claimType === 'sol' ? balances.unclaimed.sol : balances.unclaimed.ore}
           netAmount={claimType === 'sol' ? balances.claimable.sol : balances.claimable.ore}
           onSuccess={() => {

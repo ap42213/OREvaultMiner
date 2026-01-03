@@ -1,7 +1,7 @@
 //! Balance Manager
 //! 
-//! Tracks and syncs balances between wallet and on-chain ORE account.
-//! Handles both wallet SOL/ORE and unclaimed ORE account balances.
+//! Tracks and syncs balances between wallet and on-chain Miner account.
+//! Handles both wallet SOL/ORE and unclaimed Miner account balances.
 
 use anyhow::{Result, Context};
 use chrono::{DateTime, Utc};
@@ -30,7 +30,7 @@ pub struct WalletBalances {
     pub ore: f64,
 }
 
-/// Unclaimed balances (in ORE account, not yet claimed)
+/// Unclaimed balances (in Miner account, not yet claimed)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnclaimedBalances {
     /// Unclaimed SOL from winnings
@@ -53,6 +53,12 @@ pub struct ClaimableBalances {
 /// Fee percentage
 const CLAIM_FEE_PERCENT: f64 = 0.10;
 
+/// ORE token decimals (11)
+const ORE_DECIMALS: f64 = 100_000_000_000.0;
+
+/// SOL decimals (9)
+const SOL_DECIMALS: f64 = 1_000_000_000.0;
+
 /// Balance manager for tracking user balances
 #[derive(Clone)]
 pub struct BalanceManager {
@@ -65,7 +71,7 @@ impl BalanceManager {
         Self { ore_client }
     }
     
-    /// Get all balances for a wallet (cached + on-chain)
+    /// Get all balances for a wallet (on-chain)
     pub async fn get_all_balances(&self, wallet: &str) -> Result<AllBalances> {
         let wallet_pubkey: Pubkey = wallet.parse()
             .context("Invalid wallet address")?;
@@ -74,15 +80,22 @@ impl BalanceManager {
         let sol_balance = self.ore_client.get_sol_balance(&wallet_pubkey).await?;
         let ore_token_balance = self.ore_client.get_ore_token_balance(&wallet_pubkey).await?;
         
-        // Fetch ORE account balances
-        let ore_account = self.ore_client.get_ore_account_balance(&wallet_pubkey).await?;
+        // Fetch Miner account balances
+        let miner_data = self.ore_client.get_miner_data(&wallet_pubkey).await?;
         
         // Convert to human-readable units
-        let wallet_sol = sol_balance as f64 / 1_000_000_000.0;
-        let wallet_ore = ore_token_balance as f64 / 1_000_000_000.0;
-        let unclaimed_sol = ore_account.unclaimed_sol as f64 / 1_000_000_000.0;
-        let unclaimed_ore = ore_account.unclaimed_ore as f64 / 1_000_000_000.0;
-        let refined_ore = ore_account.refined_ore as f64 / 1_000_000_000.0;
+        let wallet_sol = sol_balance as f64 / SOL_DECIMALS;
+        let wallet_ore = ore_token_balance as f64 / ORE_DECIMALS;
+        
+        // Get unclaimed from miner account
+        let (unclaimed_sol, unclaimed_ore, refined_ore) = match miner_data {
+            Some(miner) => (
+                miner.rewards_sol as f64 / SOL_DECIMALS,
+                miner.rewards_ore as f64 / ORE_DECIMALS,
+                miner.refined_ore as f64 / ORE_DECIMALS,
+            ),
+            None => (0.0, 0.0, 0.0),
+        };
         
         // Calculate claimable after fee
         let claimable_sol = unclaimed_sol * (1.0 - CLAIM_FEE_PERCENT);
@@ -110,59 +123,69 @@ impl BalanceManager {
     pub async fn sync_from_chain(&self, wallet: &str, db: &Database) -> Result<AllBalances> {
         let balances = self.get_all_balances(wallet).await?;
         
-        // Update database with new balances (convert f64 to lamports i64)
+        // Update database with new balances (convert to lamports i64)
         db.update_unclaimed_balance(
             wallet,
-            (balances.unclaimed.sol * 1_000_000_000.0) as i64,
-            (balances.unclaimed.ore * 1_000_000_000.0) as i64,
-            (balances.unclaimed.refined_ore * 1_000_000_000.0) as i64,
+            (balances.unclaimed.sol * SOL_DECIMALS) as i64,
+            (balances.unclaimed.ore * ORE_DECIMALS) as i64,
+            (balances.unclaimed.refined_ore * ORE_DECIMALS) as i64,
         ).await?;
         
-        info!(
-            "Synced balances for {}: wallet={:.4} SOL, unclaimed={:.4} SOL",
-            wallet, balances.wallet.sol, balances.unclaimed.sol
+        debug!(
+            "Synced balances for {}: wallet_sol={:.4}, wallet_ore={:.4}, unclaimed_sol={:.4}, unclaimed_ore={:.4}",
+            wallet, balances.wallet.sol, balances.wallet.ore, balances.unclaimed.sol, balances.unclaimed.ore
         );
         
         Ok(balances)
     }
     
     /// Get just the wallet SOL balance
-    pub async fn get_wallet_sol(&self, wallet: &str) -> Result<f64> {
+    pub async fn get_sol_balance(&self, wallet: &str) -> Result<f64> {
         let wallet_pubkey: Pubkey = wallet.parse()
             .context("Invalid wallet address")?;
         
         let balance = self.ore_client.get_sol_balance(&wallet_pubkey).await?;
-        Ok(balance as f64 / 1_000_000_000.0)
+        Ok(balance as f64 / SOL_DECIMALS)
     }
     
-    /// Check if wallet has enough SOL for a deployment
-    pub async fn has_sufficient_balance(
-        &self,
-        wallet: &str,
-        deploy_amount: f64,
-        tip_amount: f64,
-    ) -> Result<bool> {
-        let balance = self.get_wallet_sol(wallet).await?;
-        let required = deploy_amount + tip_amount + 0.001; // Add buffer for tx fees
+    /// Get just the wallet ORE token balance
+    pub async fn get_ore_balance(&self, wallet: &str) -> Result<f64> {
+        let wallet_pubkey: Pubkey = wallet.parse()
+            .context("Invalid wallet address")?;
+        
+        let balance = self.ore_client.get_ore_token_balance(&wallet_pubkey).await?;
+        Ok(balance as f64 / ORE_DECIMALS)
+    }
+    
+    /// Check if wallet has enough SOL for a transaction
+    pub async fn has_sufficient_sol(&self, wallet: &str, required: f64) -> Result<bool> {
+        let balance = self.get_sol_balance(wallet).await?;
         Ok(balance >= required)
     }
     
-    /// Format balance for display
-    pub fn format_balance(amount: f64, decimals: usize) -> String {
-        format!("{:.decimals$}", amount, decimals = decimals)
+    /// Get miner account stats for a wallet
+    pub async fn get_miner_stats(&self, wallet: &str) -> Result<Option<MinerStats>> {
+        let wallet_pubkey: Pubkey = wallet.parse()
+            .context("Invalid wallet address")?;
+        
+        let miner_data = self.ore_client.get_miner_data(&wallet_pubkey).await?;
+        
+        Ok(miner_data.map(|m| MinerStats {
+            current_round_id: m.round_id,
+            lifetime_deployed: m.lifetime_deployed as f64 / SOL_DECIMALS,
+            lifetime_rewards_sol: m.lifetime_rewards_sol as f64 / SOL_DECIMALS,
+            lifetime_rewards_ore: m.lifetime_rewards_ore as f64 / ORE_DECIMALS,
+        }))
     }
-    
-    /// Get balance summary string
-    pub fn format_summary(balances: &AllBalances) -> String {
-        format!(
-            "Wallet: {:.4} SOL / {:.2} ORE | Unclaimed: {:.4} SOL / {:.2} ORE | Refined: {:.2} ORE",
-            balances.wallet.sol,
-            balances.wallet.ore,
-            balances.unclaimed.sol,
-            balances.unclaimed.ore,
-            balances.unclaimed.refined_ore,
-        )
-    }
+}
+
+/// Miner lifetime stats
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MinerStats {
+    pub current_round_id: u64,
+    pub lifetime_deployed: f64,
+    pub lifetime_rewards_sol: f64,
+    pub lifetime_rewards_ore: f64,
 }
 
 #[cfg(test)]
@@ -170,16 +193,9 @@ mod tests {
     use super::*;
     
     #[test]
-    fn test_format_balance() {
-        assert_eq!(BalanceManager::format_balance(1.234567, 4), "1.2346");
-        assert_eq!(BalanceManager::format_balance(0.1, 2), "0.10");
-        assert_eq!(BalanceManager::format_balance(100.0, 0), "100");
-    }
-    
-    #[test]
-    fn test_claimable_calculation() {
-        let unclaimed = 1.0;
-        let claimable = unclaimed * (1.0 - CLAIM_FEE_PERCENT);
+    fn test_fee_calculation() {
+        let amount = 1.0;
+        let claimable = amount * (1.0 - CLAIM_FEE_PERCENT);
         assert!((claimable - 0.9).abs() < 0.0001);
     }
 }
