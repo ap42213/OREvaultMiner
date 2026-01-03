@@ -505,7 +505,7 @@ impl StrategyEngine {
         }
     }
     
-    /// Make GO/NO-GO decision based on strategy
+    /// Make GO/NO-GO decision based on strategy - ALWAYS DEPLOY
     fn make_decision(
         block_evs: &[BlockEv],
         strategy: &Strategy,
@@ -530,7 +530,8 @@ impl StrategyEngine {
         };
         
         match best_block {
-            Some(block) if block.ev > 0.0 => {
+            Some(block) => {
+                // ALWAYS deploy, regardless of EV
                 RoundDecision::Deploy {
                     block_index: block.index,
                     expected_ev: block.ev,
@@ -538,16 +539,13 @@ impl StrategyEngine {
                     tip_amount: tip_cost,
                 }
             }
-            Some(block) => {
-                RoundDecision::Skip {
-                    reason: "Best EV is negative".to_string(),
-                    best_ev: block.ev,
-                }
-            }
             None => {
-                RoundDecision::Skip {
-                    reason: "No blocks available".to_string(),
-                    best_ev: 0.0,
+                // Fallback to block 0 if somehow no blocks
+                RoundDecision::Deploy {
+                    block_index: 0,
+                    expected_ev: 0.0,
+                    deploy_amount,
+                    tip_amount: tip_cost,
                 }
             }
         }
@@ -652,8 +650,12 @@ impl StrategyEngine {
         let wallet_pubkey: solana_sdk::pubkey::Pubkey = wallet.parse()
             .context("Invalid wallet address")?;
         
+        info!("Building deploy tx: wallet={}, block={}, amount={} lamports", 
+            wallet, block_index, deploy_amount);
+        
         // Get current round ID from board
         let board = ore_client.get_board_state().await?;
+        info!("Current round: {} (end_slot: {})", board.round_id, board.end_slot);
         
         // Build squares array - only the selected block is true
         let mut squares = [false; 25];
@@ -670,8 +672,11 @@ impl StrategyEngine {
             squares,
         )?;
         
+        info!("Deploy instruction built: program={}", deploy_ix.program_id);
+        
         // Get recent blockhash
         let blockhash = ore_client.get_latest_blockhash().await?;
+        info!("Blockhash: {}", blockhash);
         
         // Build bundle with tip
         let mut tx = jito_client.build_bundle(
@@ -680,6 +685,8 @@ impl StrategyEngine {
             tip_amount,
             blockhash,
         )?;
+        
+        info!("Transaction built with {} instructions", tx.message.instructions.len());
         
         // Check if we can sign server-side (automine)
         if let Some(ref wm) = wallet_manager {

@@ -91,30 +91,14 @@ impl AiStrategy {
     }
     
     /// Build concise prompt for fast AI response (~750ms target)
-    /// Strategy: Find LOWEST stake blocks, skip if all equal or none below avg
-    fn build_prompt(&self, grid: &GridState, num_blocks: usize, _strategy: &str) -> String {
-        // Calculate average stake
-        let total_stake: u64 = grid.deployed.iter().sum();
-        let avg_stake = total_stake as f64 / 25.0;
-        let avg_stake_sol = avg_stake / 1_000_000_000.0;
-        
+    /// Strategy: ALWAYS pick the lowest stake block, never skip
+    fn build_prompt(&self, grid: &GridState, _num_blocks: usize, _strategy: &str) -> String {
         // Build sorted list: (index, stake_sol)
         let mut blocks_sorted: Vec<(usize, f64)> = grid.deployed.iter()
             .enumerate()
             .map(|(i, &d)| (i, d as f64 / 1_000_000_000.0))
             .collect();
         blocks_sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        
-        // Find min/max to detect if all equal
-        let min_stake = blocks_sorted.first().map(|(_, s)| *s).unwrap_or(0.0);
-        let max_stake = blocks_sorted.last().map(|(_, s)| *s).unwrap_or(0.0);
-        let all_equal = (max_stake - min_stake).abs() < 0.001;
-        
-        // Find blocks below average
-        let below_avg: Vec<(usize, f64)> = blocks_sorted.iter()
-            .filter(|(_, stake)| *stake < avg_stake_sol * 0.99) // 1% tolerance
-            .cloned()
-            .collect();
         
         // Format block list: "idx:stake"
         let blocks_str: String = blocks_sorted.iter()
@@ -123,28 +107,18 @@ impl AiStrategy {
             .collect::<Vec<_>>()
             .join(",");
         
-        let total_pot_sol = grid.total_pot as f64 / 1_000_000_000.0;
+        let lowest_block = blocks_sorted.first().map(|(i, _)| *i).unwrap_or(0);
         
-        // Include explicit skip instruction when conditions are met
-        let skip_instruction = if all_equal {
-            "\n⚠️ ALL BLOCKS EQUAL - MUST SKIP! Return {\"blocks\":[],\"skip\":true,\"confidence\":1.0,\"reasoning\":\"all equal\"}"
-        } else if below_avg.is_empty() {
-            "\n⚠️ NO BLOCKS BELOW AVG - MUST SKIP! Return {\"blocks\":[],\"skip\":true,\"confidence\":1.0,\"reasoning\":\"none below avg\"}"
-        } else {
-            ""
-        };
-        
-        // Ultra-concise prompt for lowest-stake strategy
+        // Simple prompt - always pick lowest stake
         format!(
-            r#"ORE mining: Pick LOWEST stake block for max share.
-Blocks[idx:SOL]: [{}]
-Avg: {:.3} SOL | Below avg: {} blocks{}
+            r#"ORE mining: Pick the LOWEST stake block.
+Blocks[idx:SOL] sorted by stake: [{}]
 
-Reply JSON: {{"blocks":[idx],"confidence":0.9,"skip":false,"reasoning":"why"}}"#,
+ALWAYS pick a block. Never skip. Lowest is block {}.
+Reply JSON only: {{"blocks":[{}],"confidence":0.95,"skip":false,"reasoning":"lowest stake"}}"#,
             blocks_str,
-            avg_stake_sol,
-            below_avg.len(),
-            skip_instruction
+            lowest_block,
+            lowest_block
         )
     }
     

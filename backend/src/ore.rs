@@ -446,8 +446,30 @@ impl OreClient {
         Ok(blockhash)
     }
     
-    /// Send and confirm transaction
+    /// Send and confirm transaction with simulation first
     pub async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
+        use solana_client::rpc_config::RpcSimulateTransactionConfig;
+        
+        // Simulate first to get detailed error
+        let sim_config = RpcSimulateTransactionConfig {
+            sig_verify: true,
+            replace_recent_blockhash: false,
+            commitment: Some(solana_sdk::commitment_config::CommitmentConfig::confirmed()),
+            ..Default::default()
+        };
+        
+        let sim_result = self.rpc.simulate_transaction_with_config(tx, sim_config).await
+            .context("Failed to simulate transaction")?;
+        
+        if let Some(err) = sim_result.value.err {
+            let logs = sim_result.value.logs.unwrap_or_default().join("\n");
+            tracing::error!("Simulation failed: {:?}\nLogs:\n{}", err, logs);
+            return Err(anyhow::anyhow!("Simulation failed: {:?}\nLogs: {}", err, logs));
+        }
+        
+        tracing::info!("Simulation passed, sending transaction...");
+        
+        // Now send for real
         let sig = self.rpc.send_and_confirm_transaction(tx).await
             .context("Failed to send transaction")?;
         Ok(sig)
