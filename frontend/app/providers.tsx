@@ -50,7 +50,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (!miningWallet) return;
 
-    const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3001/ws';
+    // Build WebSocket URL from current page location
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = process.env.NEXT_PUBLIC_WS_URL || `${protocol}//${window.location.host}/ws`;
     const ws = new WebSocket(`${wsUrl}?wallet=${miningWallet}`);
     wsRef.current = ws;
 

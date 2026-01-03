@@ -1,6 +1,7 @@
 // API client for OreVault backend
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+// Use relative URLs so API calls go to the same host the page was loaded from
+const API_URL = process.env.NEXT_PUBLIC_API_URL || '';
 
 interface ApiResponse<T> {
   success: boolean;
