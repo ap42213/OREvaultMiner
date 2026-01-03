@@ -27,7 +27,7 @@ interface BetConfigState {
 export function BetConfig() {
   const { miningWallet, miningWalletLoading, isRunning, setIsRunning } = useOreVaultStore();
   const [config, setConfig] = useState<BetConfigState>({
-    strategy: 'best_ev',
+    strategy: 'conservative',  // Default to lowest stake block
     deployAmount: '0.1',
     maxTip: '0.001',
     budget: '1.0',

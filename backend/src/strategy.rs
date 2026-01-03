@@ -365,10 +365,10 @@ impl StrategyEngine {
                         decision: decision.clone(),
                     });
                     
-                    // Submit at T-1.0s if GO
+                    // Submit immediately - we're already in tight window (3 seconds or less)
                     match decision {
                         RoundDecision::Deploy { block_index, deploy_amount, tip_amount, .. } => {
-                            sleep(Duration::from_millis(600)).await;
+                            // No additional delay - window is already tight at 8 slots (~3s)
                             
                             // Build and submit bundle
                             match Self::submit_deploy(
@@ -432,24 +432,24 @@ impl StrategyEngine {
                     slots_remaining, round.round_id, round.total_deployed);
             }
             
-            // Submit when ~30 slots remaining (about 12 seconds) - more buffer for checkpoint
-            if slots_remaining <= 30 && slots_remaining > 0 {
-                info!("Entering submission window: {} slots remaining", slots_remaining);
+            // Submit when ~8 slots remaining (about 3 seconds) - tight window for best block data
+            if slots_remaining <= 8 && slots_remaining > 0 {
+                info!("Entering submission window: {} slots remaining (~{:.1}s)", slots_remaining, slots_remaining as f64 * 0.4);
                 return Ok(round);
             }
             
             if slots_remaining == 0 {
                 // Round just ended or hasn't started, poll fast to catch start of new round
-                sleep(Duration::from_millis(200)).await;
-            } else if slots_remaining > 60 {
-                // Long wait, sleep moderately
-                sleep(Duration::from_secs(2)).await;
+                sleep(Duration::from_millis(100)).await;
             } else if slots_remaining > 30 {
-                // Getting closer, poll every 500ms
-                sleep(Duration::from_millis(500)).await;
+                // Long wait, sleep moderately
+                sleep(Duration::from_secs(1)).await;
+            } else if slots_remaining > 15 {
+                // Getting closer, poll every 300ms
+                sleep(Duration::from_millis(300)).await;
             } else {
-                // Very close, poll faster
-                sleep(Duration::from_millis(50)).await;
+                // Very close (15-8 slots), poll fast
+                sleep(Duration::from_millis(100)).await;
             }
         }
     }
@@ -735,22 +735,20 @@ impl StrategyEngine {
             squares[block_index as usize] = true;
         }
         
-        // Ensure required automation + miner PDAs exist and are initialized.
-        // The deploy instruction requires the automation PDA; without this, ORE can fail with
-        // InvalidAccountData.
+        // Build automate instruction to set up automation account WITH deposit
+        // This ensures the automation PDA exists and has balance for deploy to use.
+        // The deposit covers: deploy_amount + tip + some buffer for fees
+        let automate_deposit = deploy_amount + tip_amount + 5000; // 5000 lamports buffer for checkpoint fee
         let automate_ix = ore_client.build_automate_instruction(
             &wallet_pubkey,
-            deploy_amount,
-            0, // deposit
-            &wallet_pubkey, // executor
-            0, // fee
-            0, // mask
-            2, // Discretionary
-            false,
+            deploy_amount,    // amount per square
+            automate_deposit, // deposit into automation balance
+            &wallet_pubkey,   // executor = self (we're the signer)
+            0,                // no executor fee
+            1 << block_index, // mask = selected block
+            1,                // strategy = Preferred (use the mask we set)
+            false,            // no reload
         )?;
-
-        // Checkpoint was already sent as a separate transaction above (if needed)
-        // No need to include it in the deploy transaction
         
         // Build deploy instruction using ore-api SDK
         let deploy_ix = ore_client.build_deploy_instruction(
@@ -767,7 +765,7 @@ impl StrategyEngine {
         let blockhash = ore_client.get_latest_blockhash().await?;
         info!("Blockhash: {}", blockhash);
         
-        // Build instructions list: automate + deploy (checkpoint already sent separately)
+        // Build instructions list: automate (with deposit) + deploy
         let instructions = vec![automate_ix, deploy_ix];
         
         let ix_count = instructions.len();
