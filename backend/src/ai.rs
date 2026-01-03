@@ -1,7 +1,7 @@
 //! AI Strategy Module
 //! 
-//! Uses OpenRouter API with Gemini 2.0 Flash for real-time block selection.
-//! Achieves ~750ms latency for sub-second decisions in final round seconds.
+//! Uses OpenRouter API with Gemini 3 Flash for real-time block selection.
+//! Achieves ultra-fast latency for sub-second decisions in final round seconds.
 
 use anyhow::{Result, Context};
 use reqwest::Client;
@@ -13,9 +13,9 @@ use crate::ore::BlockData;
 /// OpenRouter API endpoint
 const OPENROUTER_API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
-/// Gemini 2.0 Flash for ultra-fast mining decisions (~750ms)
-/// Fastest model that can make real-time decisions in final seconds
-const AI_MODEL: &str = "google/gemini-2.0-flash-001";
+/// Gemini 3 Flash Preview for ultra-fast mining decisions
+/// Fastest available model for real-time decisions
+const AI_MODEL: &str = "google/gemini-3-flash-preview";
 
 /// AI-based strategy selector
 #[derive(Clone)]
