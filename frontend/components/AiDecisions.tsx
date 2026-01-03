@@ -15,6 +15,8 @@ import { useOreVaultStore } from '@/lib/store';
 export function AiDecisions() {
   const { aiAnalysis, decision, transactions, isRunning } = useOreVaultStore();
 
+  const displayBlock = (idx: number) => idx + 1;
+
   return (
     <div className="bg-surface rounded-lg border border-border p-6">
       <h2 className="text-lg font-semibold mb-4">AI Decisions</h2>
@@ -39,7 +41,7 @@ export function AiDecisions() {
                   {aiAnalysis.recommendation}
                 </span>
                 {decision.block !== null && aiAnalysis.recommendation === 'DEPLOY' && (
-                  <span className="ml-2 text-muted">→ Block {decision.block}</span>
+                  <span className="ml-2 text-muted">→ Block {displayBlock(decision.block)}</span>
                 )}
               </div>
               <div className="text-right">
@@ -84,7 +86,7 @@ export function AiDecisions() {
                 {decision.action.toUpperCase()}
               </span>
               {decision.block !== null && (
-                <span className="font-mono">Block {decision.block}</span>
+                <span className="font-mono">Block {displayBlock(decision.block)}</span>
               )}
               {decision.ev > 0 && (
                 <span className="text-xs text-muted">(EV: {decision.ev.toFixed(4)})</span>
@@ -119,7 +121,7 @@ export function AiDecisions() {
                   </a>
                 </div>
                 <div className="flex items-center gap-2">
-                  <span className="text-muted">Block {tx.block}</span>
+                  <span className="text-muted">Block {displayBlock(tx.block)}</span>
                   <span className="font-mono">{tx.amount.toFixed(4)} SOL</span>
                 </div>
               </div>

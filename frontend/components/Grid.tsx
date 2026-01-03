@@ -17,6 +17,8 @@ export function Grid() {
   const [selectedBlock, setSelectedBlock] = useState<number | null>(null);
   const [showGrid, setShowGrid] = useState(true);
 
+  const displayBlock = (idx: number) => idx + 1;
+
   if (!miningWallet) return null;
 
   // Generate empty blocks if no data
@@ -92,7 +94,7 @@ export function Grid() {
                     opacity: 0.3 + intensity * 0.7,
                   }}
                 >
-                  <span className="font-mono text-[10px]">{block.index}</span>
+                  <span className="font-mono text-[10px]">{displayBlock(block.index)}</span>
                   {block.total_deployed > 0 && (
                     <span className="font-mono text-[8px] text-muted">
                       {block.total_deployed.toFixed(2)}
@@ -125,7 +127,7 @@ export function Grid() {
           {/* Selected Block Details */}
           {selectedBlock !== null && blocks[selectedBlock] && (
             <div className="mt-4 p-3 bg-surface-light rounded-lg">
-              <h4 className="font-medium mb-2">Block {selectedBlock}</h4>
+              <h4 className="font-medium mb-2">Block {displayBlock(selectedBlock)}</h4>
               <div className="grid grid-cols-2 gap-2 text-sm">
                 <div>
                   <span className="text-muted">Deployed:</span>
