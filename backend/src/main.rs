@@ -221,6 +221,27 @@ async fn start_session(
     State(state): State<Arc<AppState>>,
     Json(req): Json<StartSessionRequest>,
 ) -> impl IntoResponse {
+    // Basic input validation (safety): prevent accidental catastrophic SOL amounts.
+    // These values come from user input (frontend) and are interpreted as SOL.
+    if !req.deploy_amount.is_finite() || req.deploy_amount <= 0.0 || req.deploy_amount > 10.0 {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": "deploy_amount must be > 0 and <= 10 (SOL)"
+        }));
+    }
+    if !req.max_tip.is_finite() || req.max_tip < 0.0 || req.max_tip > 1.0 {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": "max_tip must be >= 0 and <= 1 (SOL)"
+        }));
+    }
+    if !req.budget.is_finite() || req.budget <= 0.0 {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": "budget must be > 0 (SOL)"
+        }));
+    }
+
     // Verify wallet signature for authentication
     // In production, verify the signature against a known message
     

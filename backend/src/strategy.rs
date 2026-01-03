@@ -420,7 +420,6 @@ impl StrategyEngine {
     /// Wait until we're in the submission window (near end of round)
     async fn wait_for_submission_window(ore_client: &OreClient) -> Result<RoundState> {
         let mut log_counter = 0u32;
-        let mut last_round_id = 0u64;
         
         loop {
             let round = ore_client.get_current_round_state().await?;
@@ -432,14 +431,6 @@ impl StrategyEngine {
                 debug!("Waiting for submission window: slots_remaining={}, round_id={}, total_deployed={}", 
                     slots_remaining, round.round_id, round.total_deployed);
             }
-            
-            // Detect new round - submit immediately at round start to get in early
-            if round.round_id != last_round_id && last_round_id != 0 {
-                info!("New round {} detected, submitting early!", round.round_id);
-                last_round_id = round.round_id;
-                return Ok(round);
-            }
-            last_round_id = round.round_id;
             
             // Submit when ~20 slots remaining (about 8 seconds) - more buffer
             if slots_remaining <= 20 && slots_remaining > 0 {
@@ -666,6 +657,11 @@ impl StrategyEngine {
         // Get current round ID from board
         let board = ore_client.get_board_state().await?;
         info!("Current round: {} (end_slot: {})", board.round_id, board.end_slot);
+
+        // ORE checkpoint appears to be validated against the *previous* round.
+        // Using the current round can produce "Round not valid" and effectively no-op,
+        // which then causes deploy to fail with "Miner has not checkpointed".
+        let checkpoint_round_id = board.round_id.saturating_sub(1);
         
         // Build squares array - only the selected block is true
         let mut squares = [false; 25];
@@ -691,9 +687,13 @@ impl StrategyEngine {
         let checkpoint_ix = ore_client.build_checkpoint_instruction(
             &wallet_pubkey,
             &wallet_pubkey,
-            board.round_id,
+            checkpoint_round_id,
         )?;
-        info!("Checkpoint instruction built for round {}", board.round_id);
+        info!(
+            "Checkpoint instruction built for round {} (current round: {})",
+            checkpoint_round_id,
+            board.round_id
+        );
         
         // Build deploy instruction using ore-api SDK
         let deploy_ix = ore_client.build_deploy_instruction(
