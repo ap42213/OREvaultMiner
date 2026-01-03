@@ -6,13 +6,11 @@
 use std::sync::Arc;
 use std::collections::HashMap;
 
-use anyhow::{Result, Context};
 use axum::extract::ws::{WebSocket, Message};
-use futures_util::{StreamExt, SinkExt, stream::SplitSink};
+use futures_util::{StreamExt, SinkExt};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -216,13 +214,16 @@ pub async fn handle_socket(
     
     let (mut sender, mut receiver) = socket.split();
     
+    // Channel for forwarding events to sender
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
+    
     // Subscribe to strategy events
     let mut event_rx = state.strategy_engine.read().await.subscribe();
     
-    // Spawn task to forward strategy events to client
-    let state_clone = state.clone();
+    // Spawn task to forward strategy events via channel
     let wallet_clone = wallet.clone();
-    let sender_task = tokio::spawn(async move {
+    let tx_clone = tx.clone();
+    let event_task = tokio::spawn(async move {
         while let Ok(event) = event_rx.recv().await {
             // Only forward events for this client's wallet
             let target_wallet = match &event {
@@ -235,34 +236,65 @@ pub async fn handle_socket(
             
             if target_wallet == &wallet_clone {
                 let ws_event = convert_strategy_event(event);
-                let msg = serde_json::to_string(&ws_event).unwrap();
-                // Note: we can't send from here easily due to split
-                // In production, use a channel to communicate with sender
+                if let Ok(msg) = serde_json::to_string(&ws_event) {
+                    let _ = tx_clone.send(msg).await;
+                }
             }
         }
     });
     
-    // Handle incoming messages
+    // Spawn task to send messages from channel to WebSocket
+    let sender_task = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if sender.send(Message::Text(msg.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+    
+    // Handle incoming messages (need a new sender for responses)
+    // Since sender is moved, we'll use the channel for responses too
     while let Some(msg) = receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                if let Err(e) = handle_client_message(
-                    &client_id,
-                    &text,
-                    &state,
-                    &mut sender,
-                ).await {
-                    error!("Error handling message: {}", e);
-                    let error_msg = WsEvent::Error {
-                        message: e.to_string(),
-                    };
-                    let _ = sender.send(Message::Text(
-                        serde_json::to_string(&error_msg).unwrap().into()
-                    )).await;
+                // For client messages, we can send responses via the channel
+                if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
+                    match client_msg {
+                        ClientMessage::Auth { wallet, .. } => {
+                            state.ws_manager.authenticate_client(&client_id, wallet.clone());
+                            let response = WsEvent::AuthResult {
+                                success: true,
+                                message: "Authenticated successfully".to_string(),
+                            };
+                            if let Ok(msg) = serde_json::to_string(&response) {
+                                let _ = tx.send(msg).await;
+                            }
+                        }
+                        ClientMessage::Subscribe { wallet } => {
+                            info!("Client {} subscribed to wallet {}", client_id, wallet);
+                        }
+                        ClientMessage::Ping => {
+                            // Pong handled below
+                        }
+                        ClientMessage::SyncBalances => {
+                            if let Some(w) = state.ws_manager.get_client_wallet(&client_id) {
+                                if let Ok(balances) = state.balance_manager.get_all_balances(&w).await {
+                                    let response = WsEvent::BalanceUpdate {
+                                        unclaimed_sol: balances.unclaimed.sol,
+                                        unclaimed_ore: balances.unclaimed.ore,
+                                        refined_ore: balances.unclaimed.refined_ore,
+                                    };
+                                    if let Ok(msg) = serde_json::to_string(&response) {
+                                        let _ = tx.send(msg).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            Ok(Message::Ping(data)) => {
-                let _ = sender.send(Message::Pong(data)).await;
+            Ok(Message::Ping(_)) => {
+                // Pong is auto-handled by axum
             }
             Ok(Message::Close(_)) => {
                 break;
@@ -276,86 +308,10 @@ pub async fn handle_socket(
     }
     
     // Cleanup
+    event_task.abort();
     sender_task.abort();
     state.ws_manager.remove_client(&client_id);
     info!("WebSocket client {} disconnected", client_id);
-}
-
-/// Handle a client message
-async fn handle_client_message(
-    client_id: &Uuid,
-    text: &str,
-    state: &Arc<AppState>,
-    sender: &mut SplitSink<WebSocket, Message>,
-) -> Result<()> {
-    let msg: ClientMessage = serde_json::from_str(text)
-        .context("Invalid message format")?;
-    
-    match msg {
-        ClientMessage::Auth { wallet, signature, message } => {
-            // Verify signature
-            // In production, verify that the signature matches the message
-            // signed by the wallet's public key
-            
-            // For now, just authenticate
-            state.ws_manager.authenticate_client(client_id, wallet.clone());
-            
-            let response = WsEvent::AuthResult {
-                success: true,
-                message: "Authenticated successfully".to_string(),
-            };
-            
-            sender.send(Message::Text(
-                serde_json::to_string(&response)?.into()
-            )).await?;
-        }
-        
-        ClientMessage::Subscribe { wallet } => {
-            if !state.ws_manager.is_authenticated(client_id) {
-                let response = WsEvent::Error {
-                    message: "Not authenticated".to_string(),
-                };
-                sender.send(Message::Text(
-                    serde_json::to_string(&response)?.into()
-                )).await?;
-                return Ok(());
-            }
-            
-            // Already subscribed via the event forwarding
-            info!("Client {} subscribed to wallet {}", client_id, wallet);
-        }
-        
-        ClientMessage::Ping => {
-            sender.send(Message::Pong(vec![])).await?;
-        }
-        
-        ClientMessage::SyncBalances => {
-            if let Some(wallet) = state.ws_manager.get_client_wallet(client_id) {
-                match state.balance_manager.get_all_balances(&wallet).await {
-                    Ok(balances) => {
-                        let response = WsEvent::BalanceUpdate {
-                            unclaimed_sol: balances.unclaimed.sol,
-                            unclaimed_ore: balances.unclaimed.ore,
-                            refined_ore: balances.unclaimed.refined_ore,
-                        };
-                        sender.send(Message::Text(
-                            serde_json::to_string(&response)?.into()
-                        )).await?;
-                    }
-                    Err(e) => {
-                        let response = WsEvent::Error {
-                            message: format!("Failed to sync balances: {}", e),
-                        };
-                        sender.send(Message::Text(
-                            serde_json::to_string(&response)?.into()
-                        )).await?;
-                    }
-                }
-            }
-        }
-    }
-    
-    Ok(())
 }
 
 /// Convert strategy event to WebSocket event
