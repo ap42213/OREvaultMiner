@@ -73,10 +73,14 @@ export async function startSession(params: {
   deploy_amount: number;
   max_tip: number;
   budget: number;
+  num_blocks?: number;
 }) {
   return fetchApi('/api/session/start', {
     method: 'POST',
-    body: JSON.stringify(params),
+    body: JSON.stringify({
+      ...params,
+      num_blocks: params.num_blocks ?? 1,
+    }),
   });
 }
 

@@ -11,6 +11,7 @@ interface BetConfigState {
   deployAmount: string;
   maxTip: string;
   budget: string;
+  numBlocks: number;
 }
 
 /**
@@ -31,6 +32,7 @@ export function BetConfig() {
     deployAmount: '0.1',
     maxTip: '0.001',
     budget: '1.0',
+    numBlocks: 1,
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -68,6 +70,7 @@ export function BetConfig() {
         deploy_amount: parseFloat(config.deployAmount),
         max_tip: parseFloat(config.maxTip),
         budget: parseFloat(config.budget),
+        num_blocks: config.numBlocks,
       });
 
       setIsRunning(true);
@@ -119,6 +122,28 @@ export function BetConfig() {
             </button>
           ))}
         </div>
+      </div>
+
+      {/* Number of Blocks */}
+      <div className="mb-4">
+        <label className="block text-sm text-muted mb-2">Blocks to Bet (1-25)</label>
+        <div className="grid grid-cols-5 gap-2">
+          {[1, 2, 3, 5, 10].map((n) => (
+            <button
+              key={n}
+              onClick={() => setConfig(c => ({ ...c, numBlocks: n }))}
+              disabled={isRunning}
+              className={`py-2 px-3 rounded text-sm transition-colors ${
+                config.numBlocks === n
+                  ? 'bg-primary text-black font-medium'
+                  : 'bg-surface-light hover:bg-border text-white'
+              } disabled:opacity-50`}
+            >
+              {n}
+            </button>
+          ))}
+        </div>
+        <p className="text-xs text-muted mt-1">More blocks = higher chance to win, but stake split across them</p>
       </div>
 
       {/* Deploy Amount */}

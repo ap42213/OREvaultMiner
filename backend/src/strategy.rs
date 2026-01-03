@@ -53,6 +53,7 @@ pub struct SessionConfig {
     pub strategy: Strategy,
     pub deploy_amount: u64,
     pub max_tip: u64,
+    pub num_blocks: u8,
 }
 
 /// Active session state
@@ -150,6 +151,7 @@ impl StrategyEngine {
         strategy: Strategy,
         deploy_amount: f64,
         max_tip: f64,
+        num_blocks: u8,
     ) {
         // Convert SOL to lamports
         let deploy_amount_lamports = (deploy_amount * 1_000_000_000.0) as u64;
@@ -161,6 +163,7 @@ impl StrategyEngine {
             strategy,
             deploy_amount: deploy_amount_lamports,
             max_tip: max_tip_lamports,
+            num_blocks: num_blocks.clamp(1, 25),
         };
         
         let (cancel_tx, _) = broadcast::channel(1);
@@ -282,81 +285,60 @@ impl StrategyEngine {
                         blocks: block_evs.clone(),
                     });
                     
-                    // PHASE 3: Real-time AI decision using Gemini Flash (~750ms) at T-2s
-                    // AI finds lowest stake blocks, skips if all equal
-                    let decision = if let Some(ref ai) = ai_strategy {
-                        // Build grid state for AI
-                        let slots_left = ore_client.get_slots_remaining().await.unwrap_or(0);
-                        let grid = crate::ai::GridState {
-                            deployed: blocks.iter().map(|b| b.total_deployed).collect(),
-                            miner_counts: blocks.iter().map(|b| b.miner_count).collect(),
-                            total_pot: round.total_deployed,
-                            round_id: round.round_id,
-                            slots_remaining: slots_left,
-                            deploy_amount: config.deploy_amount,
-                            tip_cost,
-                        };
-                        
-                        let strategy_hint = match config.strategy {
-                            Strategy::BestEv => "best_ev",
-                            Strategy::Conservative => "conservative",
-                            Strategy::Aggressive => "aggressive",
-                        };
-                        
-                        // Real-time AI call - Gemini Flash responds in ~750ms
-                        let start = std::time::Instant::now();
-                        match ai.select_blocks(&grid, 1, strategy_hint).await {
-                            Ok(selection) => {
-                                info!("AI decision in {}ms: skip={}, blocks={:?}, confidence={:.2}", 
-                                    start.elapsed().as_millis(), selection.skip, selection.blocks, selection.confidence);
-                                
-                                // Emit AI analysis event for frontend
-                                let _ = event_tx.send(StrategyEvent::AiAnalysis {
-                                    wallet: config.wallet.clone(),
-                                    selected_block: selection.blocks.first().copied().unwrap_or(255),
-                                    confidence: selection.confidence,
-                                    reasoning: selection.reasoning.clone(),
-                                    skip: selection.skip,
-                                });
-                                
-                                // Check if AI says to skip this round
-                                if selection.skip {
-                                    info!("AI SKIP: {}", selection.reasoning);
-                                    RoundDecision::Skip {
-                                        reason: selection.reasoning,
-                                        best_ev: 0.0,
-                                    }
-                                } else if selection.blocks.is_empty() {
-                                    RoundDecision::Skip {
-                                        reason: "AI returned no blocks".to_string(),
-                                        best_ev: 0.0,
-                                    }
-                                } else {
-                                    // Use AI's lowest-stake block selection
-                                    let block_idx = selection.blocks[0];
-                                    let block_ev = block_evs.iter()
-                                        .find(|b| b.index == block_idx)
-                                        .map(|b| b.ev)
-                                        .unwrap_or(0.0);
-                                    
-                                    info!("AI selected block {} (lowest stake) - reason: {}", 
-                                        block_idx, selection.reasoning);
-                                    RoundDecision::Deploy {
-                                        block_index: block_idx,
-                                        expected_ev: block_ev,
-                                        deploy_amount: config.deploy_amount,
-                                        tip_amount: tip_cost,
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!("AI failed ({}ms): {}, using fallback", start.elapsed().as_millis(), e);
-                                Self::make_decision(&block_evs, &config.strategy, config.deploy_amount, tip_cost)
+                    // PHASE 3: Pick lowest stake blocks (no AI - too slow)
+                    // Use num_blocks from session config
+                    let num_blocks: usize = config.num_blocks as usize;
+                    
+                    // Sort blocks by stake (lowest first)
+                    let mut sorted_blocks: Vec<(usize, u64)> = blocks.iter()
+                        .enumerate()
+                        .map(|(i, b)| (i, b.total_deployed))
+                        .collect();
+                    sorted_blocks.sort_by_key(|(_, stake)| *stake);
+                    
+                    // Take the N lowest stake blocks
+                    let selected_blocks: Vec<u8> = sorted_blocks.iter()
+                        .take(num_blocks)
+                        .map(|(i, _)| *i as u8)
+                        .collect();
+                    
+                    let first_block = selected_blocks.first().copied().unwrap_or(0);
+                    let min_stake = sorted_blocks.first().map(|(_, s)| *s).unwrap_or(0);
+                    
+                    info!("Selected {} block(s): {:?} (lowest stake: {} lamports)", 
+                        selected_blocks.len(), selected_blocks, min_stake);
+                    
+                    // Emit AI analysis event for frontend
+                    let _ = event_tx.send(StrategyEvent::AiAnalysis {
+                        wallet: config.wallet.clone(),
+                        selected_block: first_block,
+                        confidence: 0.9,
+                        reasoning: format!("Lowest {} stake block(s), min {} lamports", num_blocks, min_stake),
+                        skip: false,
+                    });
+                    
+                    let block_ev = block_evs.iter()
+                        .find(|b| b.index == first_block)
+                        .map(|b| b.ev)
+                        .unwrap_or(0.0);
+                    
+                    // For multi-block, we'll use a custom squares array
+                    let decision = RoundDecision::Deploy {
+                        block_index: first_block, // Primary block for logging
+                        expected_ev: block_ev,
+                        deploy_amount: config.deploy_amount,
+                        tip_amount: tip_cost,
+                    };
+                    
+                    // Store selected blocks for submit_deploy
+                    let selected_squares: [bool; 25] = {
+                        let mut arr = [false; 25];
+                        for &idx in &selected_blocks {
+                            if (idx as usize) < 25 {
+                                arr[idx as usize] = true;
                             }
                         }
-                    } else {
-                        // No AI - use fast EV calculation
-                        Self::make_decision(&block_evs, &config.strategy, config.deploy_amount, tip_cost)
+                        arr
                     };
                     
                     // Emit decision event
@@ -379,6 +361,7 @@ impl StrategyEngine {
                                 block_index,
                                 deploy_amount,
                                 tip_amount,
+                                selected_squares,
                             ).await {
                                 Ok(signature) => {
                                     let _ = event_tx.send(StrategyEvent::TxSubmitted {
@@ -423,7 +406,20 @@ impl StrategyEngine {
         
         loop {
             let round = ore_client.get_current_round_state().await?;
-            let slots_remaining = ore_client.get_slots_remaining().await.unwrap_or(0);
+            let board = ore_client.get_board_state().await?;
+            
+            // If end_slot is MAX, round hasn't started - wait
+            if board.end_slot == u64::MAX {
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            
+            let current_slot = ore_client.rpc().get_slot().await.unwrap_or(0);
+            let slots_remaining = if current_slot >= board.end_slot {
+                0
+            } else {
+                board.end_slot - current_slot
+            };
             
             // Log every 10 iterations to avoid spam
             log_counter += 1;
@@ -432,24 +428,27 @@ impl StrategyEngine {
                     slots_remaining, round.round_id, round.total_deployed);
             }
             
-            // Submit when ~8 slots remaining (about 3 seconds) - tight window for best block data
-            if slots_remaining <= 8 && slots_remaining > 0 {
+            // Submit when 25 or fewer slots remaining (about 10 seconds) - gives us more buffer
+            if slots_remaining <= 25 && slots_remaining > 0 {
                 info!("Entering submission window: {} slots remaining (~{:.1}s)", slots_remaining, slots_remaining as f64 * 0.4);
                 return Ok(round);
             }
             
+            // Never sleep when under 30 slots - just keep polling
+            if slots_remaining > 0 && slots_remaining <= 30 {
+                // No sleep - continuous polling
+                continue;
+            }
+            
             if slots_remaining == 0 {
-                // Round just ended or hasn't started, poll fast to catch start of new round
+                // Round just ended, poll fast to catch start of new round
+                sleep(Duration::from_millis(50)).await;
+            } else if slots_remaining > 60 {
+                // Long wait
                 sleep(Duration::from_millis(100)).await;
-            } else if slots_remaining > 30 {
-                // Long wait, sleep moderately
-                sleep(Duration::from_secs(1)).await;
-            } else if slots_remaining > 15 {
-                // Getting closer, poll every 300ms
-                sleep(Duration::from_millis(300)).await;
             } else {
-                // Very close (15-8 slots), poll fast
-                sleep(Duration::from_millis(100)).await;
+                // Getting closer (60-20 slots), poll fast
+                sleep(Duration::from_millis(20)).await;
             }
         }
     }
@@ -647,12 +646,14 @@ impl StrategyEngine {
         block_index: u8,
         deploy_amount: u64,
         tip_amount: u64,
+        squares: [bool; 25],
     ) -> Result<String> {
         let wallet_pubkey: solana_sdk::pubkey::Pubkey = wallet.parse()
             .context("Invalid wallet address")?;
         
-        info!("Building deploy tx: wallet={}, block={}, amount={} lamports", 
-            wallet, block_index, deploy_amount);
+        let blocks_selected: Vec<usize> = squares.iter().enumerate().filter(|(_, &b)| b).map(|(i, _)| i).collect();
+        info!("Building deploy tx: wallet={}, blocks={:?}, amount={} lamports", 
+            wallet, blocks_selected, deploy_amount);
         
         // Get current round ID from board
         let board = ore_client.get_board_state().await?;
@@ -729,28 +730,10 @@ impl StrategyEngine {
             }
         }
         
-        // Build squares array - only the selected block is true
-        let mut squares = [false; 25];
-        if block_index < 25 {
-            squares[block_index as usize] = true;
-        }
-        
-        // Build automate instruction to set up automation account WITH deposit
-        // This ensures the automation PDA exists and has balance for deploy to use.
-        // The deposit covers: deploy_amount + tip + some buffer for fees
-        let automate_deposit = deploy_amount + tip_amount + 5000; // 5000 lamports buffer for checkpoint fee
-        let automate_ix = ore_client.build_automate_instruction(
-            &wallet_pubkey,
-            deploy_amount,    // amount per square
-            automate_deposit, // deposit into automation balance
-            &wallet_pubkey,   // executor = self (we're the signer)
-            0,                // no executor fee
-            1 << block_index, // mask = selected block
-            1,                // strategy = Preferred (use the mask we set)
-            false,            // no reload
-        )?;
-        
-        // Build deploy instruction using ore-api SDK
+        // Build deploy instruction using ore-api SDK (squares already passed in)
+        // We do NOT include automate in the same tx because Solana instructions
+        // see original state, not modified state from prior instructions.
+        // Deploy will see empty automation account and use the direct signer path.
         let deploy_ix = ore_client.build_deploy_instruction(
             &wallet_pubkey,
             &wallet_pubkey, // authority is same as signer for user deploys
@@ -765,8 +748,8 @@ impl StrategyEngine {
         let blockhash = ore_client.get_latest_blockhash().await?;
         info!("Blockhash: {}", blockhash);
         
-        // Build instructions list: automate (with deposit) + deploy
-        let instructions = vec![automate_ix, deploy_ix];
+        // Build instructions list: just deploy (no automate - it causes state isolation issues)
+        let instructions = vec![deploy_ix];
         
         let ix_count = instructions.len();
         
@@ -778,7 +761,7 @@ impl StrategyEngine {
             blockhash,
         )?;
 
-        info!("Transaction built with {} instructions (automate + deploy + tip)", 
+        info!("Transaction built with {} instructions (deploy + tip)", 
             tx.message.instructions.len()
         );
         

@@ -473,32 +473,52 @@ impl OreClient {
         Ok(blockhash)
     }
     
-    /// Send and confirm transaction with simulation first
+    /// Send a transaction quickly.
+    ///
+    /// By default this *skips preflight* and does *not* wait for confirmation,
+    /// which is substantially faster and more reliable close to round end.
+    ///
+    /// Set `OREVAULT_SIMULATE=1` to enable simulation logging for debugging.
     pub async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
-        use solana_client::rpc_config::RpcSimulateTransactionConfig;
-        
-        // Simulate first to get detailed error
-        let sim_config = RpcSimulateTransactionConfig {
-            sig_verify: true,
-            replace_recent_blockhash: false,
-            commitment: Some(solana_sdk::commitment_config::CommitmentConfig::confirmed()),
+        use solana_client::rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig};
+
+        // Optional simulation for debugging only (too slow for hot path).
+        if std::env::var("OREVAULT_SIMULATE").ok().as_deref() == Some("1") {
+            let sim_config = RpcSimulateTransactionConfig {
+                sig_verify: true,
+                replace_recent_blockhash: false,
+                commitment: Some(solana_sdk::commitment_config::CommitmentConfig::processed()),
+                ..Default::default()
+            };
+
+            let sim_result = self
+                .rpc
+                .simulate_transaction_with_config(tx, sim_config)
+                .await
+                .context("Failed to simulate transaction")?;
+
+            if let Some(err) = sim_result.value.err {
+                let logs = sim_result.value.logs.unwrap_or_default().join("\n");
+                tracing::error!("Simulation failed: {:?}\nLogs:\n{}", err, logs);
+                return Err(anyhow::anyhow!("Simulation failed: {:?}\nLogs: {}", err, logs));
+            }
+        }
+
+        tracing::info!("Sending transaction...");
+
+        // Fast send (no confirm). This is the best shot when racing the round end.
+        let send_config = RpcSendTransactionConfig {
+            skip_preflight: true,
+            preflight_commitment: Some(solana_sdk::commitment_config::CommitmentLevel::Processed),
             ..Default::default()
         };
-        
-        let sim_result = self.rpc.simulate_transaction_with_config(tx, sim_config).await
-            .context("Failed to simulate transaction")?;
-        
-        if let Some(err) = sim_result.value.err {
-            let logs = sim_result.value.logs.unwrap_or_default().join("\n");
-            tracing::error!("Simulation failed: {:?}\nLogs:\n{}", err, logs);
-            return Err(anyhow::anyhow!("Simulation failed: {:?}\nLogs: {}", err, logs));
-        }
-        
-        tracing::info!("Simulation passed, sending transaction...");
-        
-        // Now send for real
-        let sig = self.rpc.send_and_confirm_transaction(tx).await
+
+        let sig = self
+            .rpc
+            .send_transaction_with_config(tx, send_config)
+            .await
             .context("Failed to send transaction")?;
+
         Ok(sig)
     }
     

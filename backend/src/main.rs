@@ -206,7 +206,11 @@ pub struct StartSessionRequest {
     pub deploy_amount: f64,
     pub max_tip: f64,
     pub budget: f64,
+    #[serde(default = "default_num_blocks")]
+    pub num_blocks: u8,
 }
+
+fn default_num_blocks() -> u8 { 1 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -241,6 +245,7 @@ async fn start_session(
             "error": "budget must be > 0 (SOL)"
         }));
     }
+    let num_blocks = req.num_blocks.clamp(1, 25);
 
     // Verify wallet signature for authentication
     // In production, verify the signature against a known message
@@ -260,7 +265,7 @@ async fn start_session(
         Ok(session) => {
             // Start the strategy engine for this wallet
             let mut engine = state.strategy_engine.write().await;
-            engine.start_session(session.id, req.wallet.clone(), req.strategy, req.deploy_amount, req.max_tip).await;
+            engine.start_session(session.id, req.wallet.clone(), req.strategy, req.deploy_amount, req.max_tip, num_blocks).await;
             
             info!("Started session {} for wallet {}", session.id, req.wallet);
             Json(serde_json::json!({

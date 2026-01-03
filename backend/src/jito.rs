@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use anyhow::{Result, Context};
+use base64::Engine;
 use solana_sdk::{
     instruction::Instruction,
     pubkey::Pubkey,
@@ -28,8 +29,8 @@ const JITO_TIP_ACCOUNTS: [&str; 8] = [
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ];
 
-/// Jito Block Engine RPC endpoints
-const JITO_MAINNET_RPC: &str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
+/// Jito Block Engine RPC endpoints (NY for lower latency from East US)
+const JITO_MAINNET_RPC: &str = "https://ny.mainnet.block-engine.jito.wtf/api/v1/bundles";
 
 /// Bundle status returned by Jito
 #[derive(Debug, Clone)]
@@ -119,13 +120,24 @@ impl JitoClient {
             }
         }
         
-        // Jito expects base64-encoded serialized transactions (same format as sendTransaction)
-        let serialized_txs: Vec<String> = transactions.iter()
-            .map(|tx| {
-                let bytes = bincode::serialize(tx).expect("Failed to serialize tx");
-                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
-            })
-            .collect();
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum TxEncoding {
+            Base64,
+            Base58,
+        }
+
+        let serialize_with = |encoding: TxEncoding| -> Vec<String> {
+            transactions
+                .iter()
+                .map(|tx| {
+                    let bytes = bincode::serialize(tx).expect("Failed to serialize tx");
+                    match encoding {
+                        TxEncoding::Base64 => base64::engine::general_purpose::STANDARD.encode(bytes),
+                        TxEncoding::Base58 => bs58::encode(&bytes).into_string(),
+                    }
+                })
+                .collect()
+        };
         
         // Collect signatures
         let signatures: Vec<Signature> = transactions.iter()
@@ -141,75 +153,105 @@ impl JitoClient {
             transactions.len()
         );
         
-        // Build JSON-RPC request
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendBundle",
-            "params": [serialized_txs]
-        });
-        
         // Create HTTP client
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .context("Failed to create HTTP client")?;
-        
-        // Submit via HTTP
-        match client
-            .post(&self.block_engine_url)
-            .json(&request)
-            .send()
-            .await
-        {
-            Ok(response) => {
-                if response.status().is_success() {
-                    let result: serde_json::Value = response.json().await
-                        .unwrap_or_else(|_| serde_json::json!({}));
-                    
-                    if let Some(error) = result.get("error") {
-                        error!("Bundle {} failed: {:?}", bundle_id, error);
-                        Ok(BundleResult {
-                            bundle_id,
-                            status: BundleStatus::Failed { 
-                                reason: error.to_string() 
-                            },
-                            tip_amount: 0,
-                            signatures,
-                        })
-                    } else {
-                        info!("Bundle {} submitted successfully", bundle_id);
-                        Ok(BundleResult {
-                            bundle_id,
-                            status: BundleStatus::Pending,
-                            tip_amount: self.extract_tip_amount(&transactions),
-                            signatures,
-                        })
-                    }
-                } else {
-                    let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
-                    error!("Bundle {} HTTP error {}: {}", bundle_id, status, body);
-                    Ok(BundleResult {
+
+        let mut last_http_error: Option<String> = None;
+        for encoding in [TxEncoding::Base64, TxEncoding::Base58] {
+            let serialized_txs = serialize_with(encoding);
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "sendBundle",
+                "params": [serialized_txs]
+            });
+
+            let response = match client
+                .post(&self.block_engine_url)
+                .json(&request)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("Bundle {} network error: {}", bundle_id, e);
+                    return Ok(BundleResult {
                         bundle_id,
-                        status: BundleStatus::Failed { 
-                            reason: format!("HTTP {}: {}", status, body) 
+                        status: BundleStatus::Failed { reason: e.to_string() },
+                        tip_amount: 0,
+                        signatures,
+                    });
+                }
+            };
+
+            if response.status().is_success() {
+                let result: serde_json::Value = response
+                    .json()
+                    .await
+                    .unwrap_or_else(|_| serde_json::json!({}));
+
+                if let Some(err_val) = result.get("error") {
+                    error!("Bundle {} failed: {:?}", bundle_id, err_val);
+                    return Ok(BundleResult {
+                        bundle_id,
+                        status: BundleStatus::Failed {
+                            reason: err_val.to_string(),
                         },
                         tip_amount: 0,
                         signatures,
-                    })
+                    });
                 }
-            }
-            Err(e) => {
-                error!("Bundle {} network error: {}", bundle_id, e);
-                Ok(BundleResult {
+
+                info!(
+                    "Bundle {} submitted successfully (encoding: {:?})",
+                    bundle_id, encoding
+                );
+                return Ok(BundleResult {
                     bundle_id,
-                    status: BundleStatus::Failed { reason: e.to_string() },
-                    tip_amount: 0,
+                    status: BundleStatus::Pending,
+                    tip_amount: self.extract_tip_amount(&transactions),
                     signatures,
-                })
+                });
             }
+
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let reason = format!("HTTP {}: {}", status, body);
+            error!(
+                "Bundle {} HTTP error (encoding: {:?}) {}",
+                bundle_id, encoding, reason
+            );
+
+            let body_lc = reason.to_lowercase();
+            let is_decode_error = body_lc.contains("could not be decoded")
+                || body_lc.contains("couldn't be decoded")
+                || body_lc.contains("cannot be decoded");
+
+            if is_decode_error && encoding == TxEncoding::Base64 {
+                warn!("Jito decode error; retrying bundle with base58 encoding");
+                last_http_error = Some(reason);
+                continue;
+            }
+
+            return Ok(BundleResult {
+                bundle_id,
+                status: BundleStatus::Failed { reason },
+                tip_amount: 0,
+                signatures,
+            });
         }
+
+        Ok(BundleResult {
+            bundle_id,
+            status: BundleStatus::Failed {
+                reason: last_http_error.unwrap_or_else(|| "Unknown Jito submission failure".to_string()),
+            },
+            tip_amount: 0,
+            signatures,
+        })
     }
     
     /// Submit a single transaction as a bundle
