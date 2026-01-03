@@ -764,30 +764,57 @@ impl StrategyEngine {
                 info!("Signed transaction server-side for automine");
                 
                 // Try Jito bundle submission first for better inclusion
-                match jito_client.send_bundle(vec![tx.clone()]).await {
+                let jito_success = match jito_client.send_bundle(vec![tx.clone()]).await {
                     Ok(result) => {
-                        info!("Transaction sent via Jito bundle: {} (status: {:?})", result.bundle_id, result.status);
-                        // Return first signature from bundle
-                        if let Some(sig) = result.signatures.first() {
-                            return Ok(sig.to_string());
+                        info!("Jito bundle submitted: {} (status: {:?})", result.bundle_id, result.status);
+                        // Check if bundle actually succeeded
+                        match &result.status {
+                            crate::jito::BundleStatus::Landed { slot } => {
+                                info!("Jito bundle landed at slot {}", slot);
+                                if let Some(sig) = result.signatures.first() {
+                                    return Ok(sig.to_string());
+                                }
+                                return Ok(result.bundle_id);
+                            }
+                            crate::jito::BundleStatus::Failed { reason } => {
+                                warn!("Jito bundle failed: {}, falling back to RPC", reason);
+                                false
+                            }
+                            crate::jito::BundleStatus::Dropped => {
+                                warn!("Jito bundle dropped, falling back to RPC");
+                                false
+                            }
+                            crate::jito::BundleStatus::Pending => {
+                                // Pending status - try to get signature anyway
+                                if let Some(sig) = result.signatures.first() {
+                                    return Ok(sig.to_string());
+                                }
+                                warn!("Jito bundle pending, no signature yet, falling back to RPC");
+                                false
+                            }
                         }
-                        return Ok(result.bundle_id);
                     }
                     Err(jito_err) => {
-                        warn!("Jito bundle failed, falling back to RPC: {}", jito_err);
-                        // Fallback to direct RPC
-                        match ore_client.send_transaction(&tx).await {
-                            Ok(sig) => {
-                                info!("Transaction sent via RPC fallback: {}", sig);
-                                return Ok(sig.to_string());
-                            }
-                            Err(rpc_err) => {
-                                error!("RPC fallback also failed: {}", rpc_err);
-                                return Err(anyhow::anyhow!("Both Jito and RPC failed: {}", rpc_err));
-                            }
+                        warn!("Jito bundle error, falling back to RPC: {}", jito_err);
+                        false
+                    }
+                };
+                
+                // Fallback to direct RPC if Jito failed
+                if !jito_success {
+                    match ore_client.send_transaction(&tx).await {
+                        Ok(sig) => {
+                            info!("Transaction sent via RPC fallback: {}", sig);
+                            return Ok(sig.to_string());
+                        }
+                        Err(rpc_err) => {
+                            error!("RPC fallback also failed: {}", rpc_err);
+                            return Err(anyhow::anyhow!("Both Jito and RPC failed: {}", rpc_err));
                         }
                     }
                 }
+                
+                unreachable!()
             }
         }
         
