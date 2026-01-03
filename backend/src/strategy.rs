@@ -661,6 +661,8 @@ impl StrategyEngine {
         // Check if miner PDA exists and needs checkpointing.
         // The ORE deploy instruction requires: miner.checkpoint_id == miner.round_id
         // So we must checkpoint the miner's LAST round (miner.round_id), not the board's round.
+        // IMPORTANT: Checkpoint must be sent as a SEPARATE transaction before deploy
+        // because Solana instructions in the same tx see original state, not modified state.
         let miner_data = ore_client.get_miner_data(&wallet_pubkey).await?;
         let needs_checkpoint = match &miner_data {
             Some(m) => {
@@ -675,6 +677,57 @@ impl StrategyEngine {
                 false
             }
         };
+        
+        // If checkpoint is needed, send it as a SEPARATE transaction first
+        if needs_checkpoint {
+            let miner_round_id = miner_data.as_ref().unwrap().round_id;
+            info!(
+                "Sending checkpoint transaction FIRST for miner's round {} (current board round: {})",
+                miner_round_id, board.round_id
+            );
+            
+            let checkpoint_ix = ore_client.build_checkpoint_instruction(
+                &wallet_pubkey,
+                &wallet_pubkey,
+                miner_round_id,
+            )?;
+            
+            let blockhash = ore_client.get_latest_blockhash().await?;
+            
+            // Build and sign checkpoint transaction (need wallet_manager for signing)
+            if let Some(ref wm) = wallet_manager {
+                let mut checkpoint_tx = solana_sdk::transaction::Transaction::new_with_payer(
+                    &[checkpoint_ix],
+                    Some(&wallet_pubkey),
+                );
+                checkpoint_tx.message.recent_blockhash = blockhash;
+                wm.sign_transaction(wallet, &mut checkpoint_tx).await
+                    .context("Failed to sign checkpoint transaction")?;
+                
+                // Send checkpoint transaction via RPC (not Jito - doesn't need priority)
+                match ore_client.send_transaction(&checkpoint_tx).await {
+                    Ok(sig) => {
+                        info!("Checkpoint transaction sent: {}", sig);
+                        // Wait a bit for confirmation
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    }
+                    Err(e) => {
+                        // Checkpoint might fail if already done or round expired - that's OK
+                        warn!("Checkpoint transaction failed (may be OK): {}", e);
+                    }
+                }
+                
+                // Re-fetch miner data to confirm checkpoint worked
+                if let Some(m) = ore_client.get_miner_data(&wallet_pubkey).await? {
+                    info!(
+                        "After checkpoint: round_id={}, checkpoint_id={}",
+                        m.round_id, m.checkpoint_id
+                    );
+                }
+            } else {
+                warn!("No wallet manager - cannot sign checkpoint transaction server-side");
+            }
+        }
         
         // Build squares array - only the selected block is true
         let mut squares = [false; 25];
@@ -696,25 +749,8 @@ impl StrategyEngine {
             false,
         )?;
 
-        // Build checkpoint instruction - uses the MINER's round_id (not board's)
-        // Only include if miner needs checkpointing
-        let checkpoint_ix = if needs_checkpoint {
-            let miner_round_id = miner_data.as_ref().unwrap().round_id;
-            let ix = ore_client.build_checkpoint_instruction(
-                &wallet_pubkey,
-                &wallet_pubkey,
-                miner_round_id,
-            )?;
-            info!(
-                "Checkpoint instruction built for miner's round {} (current board round: {})",
-                miner_round_id,
-                board.round_id
-            );
-            Some(ix)
-        } else {
-            info!("Skipping checkpoint - miner already checkpointed or new");
-            None
-        };
+        // Checkpoint was already sent as a separate transaction above (if needed)
+        // No need to include it in the deploy transaction
         
         // Build deploy instruction using ore-api SDK
         let deploy_ix = ore_client.build_deploy_instruction(
@@ -731,12 +767,8 @@ impl StrategyEngine {
         let blockhash = ore_client.get_latest_blockhash().await?;
         info!("Blockhash: {}", blockhash);
         
-        // Build instructions list: automate + (optional checkpoint) + deploy
-        let mut instructions = vec![automate_ix];
-        if let Some(ckpt_ix) = checkpoint_ix {
-            instructions.push(ckpt_ix);
-        }
-        instructions.push(deploy_ix);
+        // Build instructions list: automate + deploy (checkpoint already sent separately)
+        let instructions = vec![automate_ix, deploy_ix];
         
         let ix_count = instructions.len();
         
@@ -748,9 +780,8 @@ impl StrategyEngine {
             blockhash,
         )?;
 
-        info!("Transaction built with {} instructions (automate + {}checkpoint + deploy + tip)", 
-            tx.message.instructions.len(),
-            if ix_count == 3 { "" } else { "no " }
+        info!("Transaction built with {} instructions (automate + deploy + tip)", 
+            tx.message.instructions.len()
         );
         
         // Check if we can sign server-side (automine)
