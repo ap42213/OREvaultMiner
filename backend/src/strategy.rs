@@ -389,8 +389,17 @@ impl StrategyEngine {
                         }
                     }
                     
-                    // Wait for round to end plus buffer
-                    sleep(Duration::from_secs(3)).await;
+                    // Wait for this round to end before looking for next
+                    let current_round = round.round_id;
+                    loop {
+                        sleep(Duration::from_millis(500)).await;
+                        if let Ok(new_round) = ore_client.get_current_round_state().await {
+                            if new_round.round_id != current_round {
+                                info!("Round {} ended, moving to round {}", current_round, new_round.round_id);
+                                break;
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!("Error waiting for submission window: {}", e);
@@ -423,19 +432,19 @@ impl StrategyEngine {
             
             // Log every 10 iterations to avoid spam
             log_counter += 1;
-            if log_counter % 10 == 1 {
+            if log_counter % 10 == 1 || slots_remaining <= 30 {
                 debug!("Waiting for submission window: slots_remaining={}, round_id={}, total_deployed={}", 
                     slots_remaining, round.round_id, round.total_deployed);
             }
             
-            // Submit when 25 or fewer slots remaining (about 10 seconds) - gives us more buffer
-            if slots_remaining <= 25 && slots_remaining > 0 {
+            // Submit when 30 or fewer slots remaining (about 12 seconds) - gives us more buffer
+            if slots_remaining <= 30 && slots_remaining > 0 {
                 info!("Entering submission window: {} slots remaining (~{:.1}s)", slots_remaining, slots_remaining as f64 * 0.4);
                 return Ok(round);
             }
             
-            // Never sleep when under 30 slots - just keep polling
-            if slots_remaining > 0 && slots_remaining <= 30 {
+            // Never sleep when under 40 slots - just keep polling
+            if slots_remaining > 0 && slots_remaining <= 40 {
                 // No sleep - continuous polling
                 continue;
             }
@@ -748,22 +757,14 @@ impl StrategyEngine {
         let blockhash = ore_client.get_latest_blockhash().await?;
         info!("Blockhash: {}", blockhash);
         
-        // Build instructions list: just deploy (no automate - it causes state isolation issues)
-        let instructions = vec![deploy_ix];
-        
-        let ix_count = instructions.len();
-        
-        // Build bundle with instructions + tip
-        let mut tx = jito_client.build_bundle(
-            instructions,
-            &wallet_pubkey,
-            tip_amount,
-            blockhash,
-        )?;
-
-        info!("Transaction built with {} instructions (deploy + tip)", 
-            tx.message.instructions.len()
+        // Build transaction directly (no Jito tip - disabled)
+        let mut tx = solana_sdk::transaction::Transaction::new_with_payer(
+            &[deploy_ix],
+            Some(&wallet_pubkey),
         );
+        tx.message.recent_blockhash = blockhash;
+
+        info!("Transaction built with deploy instruction (no tip)");
         
         // Check if we can sign server-side (automine)
         if let Some(ref wm) = wallet_manager {
@@ -775,58 +776,17 @@ impl StrategyEngine {
                 
                 info!("Signed transaction server-side for automine");
                 
-                // Try Jito bundle submission first for better inclusion
-                let jito_success = match jito_client.send_bundle(vec![tx.clone()]).await {
-                    Ok(result) => {
-                        info!("Jito bundle submitted: {} (status: {:?})", result.bundle_id, result.status);
-                        // Check if bundle actually succeeded
-                        match &result.status {
-                            crate::jito::BundleStatus::Landed { slot } => {
-                                info!("Jito bundle landed at slot {}", slot);
-                                if let Some(sig) = result.signatures.first() {
-                                    return Ok(sig.to_string());
-                                }
-                                return Ok(result.bundle_id);
-                            }
-                            crate::jito::BundleStatus::Failed { reason } => {
-                                warn!("Jito bundle failed: {}, falling back to RPC", reason);
-                                false
-                            }
-                            crate::jito::BundleStatus::Dropped => {
-                                warn!("Jito bundle dropped, falling back to RPC");
-                                false
-                            }
-                            crate::jito::BundleStatus::Pending => {
-                                // Pending status - try to get signature anyway
-                                if let Some(sig) = result.signatures.first() {
-                                    return Ok(sig.to_string());
-                                }
-                                warn!("Jito bundle pending, no signature yet, falling back to RPC");
-                                false
-                            }
-                        }
+                // Send directly via RPC (Jito disabled - too unreliable)
+                match ore_client.send_transaction(&tx).await {
+                    Ok(sig) => {
+                        info!("Transaction sent via RPC: {}", sig);
+                        return Ok(sig.to_string());
                     }
-                    Err(jito_err) => {
-                        warn!("Jito bundle error, falling back to RPC: {}", jito_err);
-                        false
-                    }
-                };
-                
-                // Fallback to direct RPC if Jito failed
-                if !jito_success {
-                    match ore_client.send_transaction(&tx).await {
-                        Ok(sig) => {
-                            info!("Transaction sent via RPC fallback: {}", sig);
-                            return Ok(sig.to_string());
-                        }
-                        Err(rpc_err) => {
-                            error!("RPC fallback also failed: {}", rpc_err);
-                            return Err(anyhow::anyhow!("Both Jito and RPC failed: {}", rpc_err));
-                        }
+                    Err(rpc_err) => {
+                        error!("RPC send failed: {}", rpc_err);
+                        return Err(anyhow::anyhow!("RPC send failed: {}", rpc_err));
                     }
                 }
-                
-                unreachable!()
             }
         }
         

@@ -127,22 +127,19 @@ export function BetConfig() {
       {/* Number of Blocks */}
       <div className="mb-4">
         <label className="block text-sm text-muted mb-2">Blocks to Bet (1-25)</label>
-        <div className="grid grid-cols-5 gap-2">
-          {[1, 2, 3, 5, 10].map((n) => (
-            <button
-              key={n}
-              onClick={() => setConfig(c => ({ ...c, numBlocks: n }))}
-              disabled={isRunning}
-              className={`py-2 px-3 rounded text-sm transition-colors ${
-                config.numBlocks === n
-                  ? 'bg-primary text-black font-medium'
-                  : 'bg-surface-light hover:bg-border text-white'
-              } disabled:opacity-50`}
-            >
-              {n}
-            </button>
-          ))}
-        </div>
+        <input
+          type="number"
+          min="1"
+          max="25"
+          step="1"
+          value={config.numBlocks}
+          onChange={(e) => {
+            const val = Math.min(25, Math.max(1, parseInt(e.target.value) || 1));
+            setConfig(c => ({ ...c, numBlocks: val }));
+          }}
+          disabled={isRunning}
+          className="w-full bg-surface-light border border-border rounded-lg py-2 px-3 font-mono focus:outline-none focus:border-primary disabled:opacity-50"
+        />
         <p className="text-xs text-muted mt-1">More blocks = higher chance to win, but stake split across them</p>
       </div>
 
