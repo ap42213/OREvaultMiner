@@ -145,16 +145,17 @@ export function BetConfig() {
 
       {/* Deploy Amount */}
       <div className="mb-4">
-        <label className="block text-sm text-muted mb-2">Deploy Amount (SOL)</label>
+        <label className="block text-sm text-muted mb-2">Deploy Amount per Block (SOL)</label>
         <input
           type="number"
-          step="0.01"
-          min="0.01"
+          step="0.0001"
+          min="0.0001"
           value={config.deployAmount}
           onChange={(e) => setConfig(c => ({ ...c, deployAmount: e.target.value }))}
           disabled={isRunning}
           className="w-full bg-surface-light border border-border rounded-lg py-2 px-3 font-mono focus:outline-none focus:border-primary disabled:opacity-50"
         />
+        <p className="text-xs text-muted mt-1">Amount deployed per block each round (min 0.0001 SOL = 100,000 lamports)</p>
       </div>
 
       {/* Max Tip */}

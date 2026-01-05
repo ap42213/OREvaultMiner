@@ -159,6 +159,7 @@ async fn main() -> Result<()> {
         .route("/api/claim/sol", post(claim_sol))
         .route("/api/claim/ore", post(claim_ore))
         .route("/api/claims/history", get(get_claims_history))
+        .route("/api/withdraw/automation", post(withdraw_automation))
         // Wallet management (automine)
         .route("/api/wallet/generate", post(generate_wallet))
         .route("/api/wallet/import", post(import_wallet))
@@ -227,12 +228,21 @@ async fn start_session(
 ) -> impl IntoResponse {
     // Basic input validation (safety): prevent accidental catastrophic SOL amounts.
     // These values come from user input (frontend) and are interpreted as SOL.
-    if !req.deploy_amount.is_finite() || req.deploy_amount <= 0.0 || req.deploy_amount > 10.0 {
+    // Minimum 0.0001 SOL (100,000 lamports) per square
+    if !req.deploy_amount.is_finite() || req.deploy_amount < 0.0001 || req.deploy_amount > 10.0 {
         return Json(serde_json::json!({
             "success": false,
-            "error": "deploy_amount must be > 0 and <= 10 (SOL)"
+            "error": "deploy_amount must be >= 0.0001 and <= 10 (SOL)"
         }));
     }
+    
+    // Log the received values for debugging
+    tracing::info!("Session request: wallet={}, deploy_amount={} SOL ({} lamports), num_blocks={}",
+        req.wallet,
+        req.deploy_amount,
+        (req.deploy_amount * 1_000_000_000.0) as u64,
+        req.num_blocks
+    );
     if !req.max_tip.is_finite() || req.max_tip < 0.0 || req.max_tip > 1.0 {
         return Json(serde_json::json!({
             "success": false,
@@ -464,6 +474,176 @@ async fn claim_ore(
             "error": e.to_string()
         }))
     }
+}
+
+#[derive(Deserialize)]
+pub struct WithdrawAutomationRequest {
+    pub wallet: String,
+    pub destination: String,
+}
+
+/// Close automation account and transfer all funds to destination
+async fn withdraw_automation(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<WithdrawAutomationRequest>,
+) -> impl IntoResponse {
+    use solana_sdk::pubkey::Pubkey;
+    use std::str::FromStr;
+    
+    let wallet_pubkey = match Pubkey::from_str(&req.wallet) {
+        Ok(pk) => pk,
+        Err(_) => return Json(serde_json::json!({
+            "success": false,
+            "error": "Invalid wallet pubkey"
+        }))
+    };
+    
+    let destination = match Pubkey::from_str(&req.destination) {
+        Ok(pk) => pk,
+        Err(_) => return Json(serde_json::json!({
+            "success": false,
+            "error": "Invalid destination pubkey"
+        }))
+    };
+    
+    // Check if wallet is managed
+    if !state.wallet_manager.has_keypair(&req.wallet).await {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": "Wallet not managed by this server"
+        }));
+    }
+    
+    // Build automate instruction with default executor to close the account
+    let close_ix = state.ore_client.build_automate_instruction(
+        &wallet_pubkey,
+        0,  // amount
+        0,  // deposit
+        &Pubkey::default(),  // executor = default closes the account
+        0,  // fee
+        0,  // mask
+        0,  // strategy
+        false,  // reload
+    );
+    
+    let close_ix = match close_ix {
+        Ok(ix) => ix,
+        Err(e) => return Json(serde_json::json!({
+            "success": false,
+            "error": format!("Failed to build close instruction: {}", e)
+        }))
+    };
+    
+    // Get blockhash and build transaction
+    let blockhash = match state.ore_client.get_latest_blockhash().await {
+        Ok(bh) => bh,
+        Err(e) => return Json(serde_json::json!({
+            "success": false,
+            "error": format!("Failed to get blockhash: {}", e)
+        }))
+    };
+    
+    // Add compute budget
+    let cu_limit_ix = solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(400_000);
+    let cu_price_ix = solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(100_000);
+    
+    let mut close_tx = solana_sdk::transaction::Transaction::new_with_payer(
+        &[cu_limit_ix, cu_price_ix, close_ix],
+        Some(&wallet_pubkey),
+    );
+    close_tx.message.recent_blockhash = blockhash;
+    
+    // Sign and send
+    if let Err(e) = state.wallet_manager.sign_transaction(&req.wallet, &mut close_tx).await {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": format!("Failed to sign close transaction: {}", e)
+        }));
+    }
+    
+    let close_sig = match state.ore_client.send_transaction(&close_tx).await {
+        Ok(sig) => sig,
+        Err(e) => return Json(serde_json::json!({
+            "success": false,
+            "error": format!("Failed to send close transaction: {}", e)
+        }))
+    };
+    
+    // Wait for confirmation
+    let _ = state.ore_client.confirm_transaction(&close_sig, 10).await;
+    
+    // Now get the wallet balance and transfer to destination
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    
+    let balance = match state.ore_client.rpc().get_balance(&wallet_pubkey).await {
+        Ok(b) => b,
+        Err(e) => return Json(serde_json::json!({
+            "success": true,
+            "close_tx": close_sig.to_string(),
+            "transfer_tx": null,
+            "message": format!("Automation closed but failed to get balance: {}", e)
+        }))
+    };
+    
+    if balance <= 5000 {
+        return Json(serde_json::json!({
+            "success": true,
+            "close_tx": close_sig.to_string(),
+            "transfer_tx": null,
+            "balance": balance,
+            "message": "Automation closed, no balance to transfer"
+        }));
+    }
+    
+    // Transfer remaining balance to destination
+    let transfer_amount = balance - 5000; // Leave enough for rent
+    let transfer_ix = solana_sdk::system_instruction::transfer(&wallet_pubkey, &destination, transfer_amount);
+    
+    let blockhash = match state.ore_client.get_latest_blockhash().await {
+        Ok(bh) => bh,
+        Err(_) => return Json(serde_json::json!({
+            "success": true,
+            "close_tx": close_sig.to_string(),
+            "transfer_tx": null,
+            "balance": balance,
+            "message": "Automation closed but transfer failed (blockhash)"
+        }))
+    };
+    
+    let mut transfer_tx = solana_sdk::transaction::Transaction::new_with_payer(
+        &[transfer_ix],
+        Some(&wallet_pubkey),
+    );
+    transfer_tx.message.recent_blockhash = blockhash;
+    
+    if let Err(e) = state.wallet_manager.sign_transaction(&req.wallet, &mut transfer_tx).await {
+        return Json(serde_json::json!({
+            "success": true,
+            "close_tx": close_sig.to_string(),
+            "transfer_tx": null,
+            "balance": balance,
+            "message": format!("Automation closed but transfer failed (sign): {}", e)
+        }));
+    }
+    
+    let transfer_sig = match state.ore_client.send_transaction(&transfer_tx).await {
+        Ok(sig) => sig,
+        Err(e) => return Json(serde_json::json!({
+            "success": true,
+            "close_tx": close_sig.to_string(),
+            "transfer_tx": null,
+            "balance": balance,
+            "message": format!("Automation closed but transfer failed (send): {}", e)
+        }))
+    };
+    
+    Json(serde_json::json!({
+        "success": true,
+        "close_tx": close_sig.to_string(),
+        "transfer_tx": transfer_sig.to_string(),
+        "amount_transferred": transfer_amount,
+        "destination": destination.to_string()
+    }))
 }
 
 /// Get claims history

@@ -415,6 +415,48 @@ impl OreClient {
         Ok(ore_api::sdk::checkpoint(*signer, *authority, round_id))
     }
 
+    /// Check if automation account exists for a user
+    /// 
+    /// The automation account MUST exist for the ORE v3 deploy instruction to work.
+    /// If it doesn't exist, we need to call `automate` to create it first.
+    pub async fn automation_exists(&self, authority: &Pubkey) -> Result<bool> {
+        let (automation_address, _) = ore_api::state::automation_pda(*authority);
+        match self.rpc.get_account(&automation_address).await {
+            Ok(account) => {
+                // Account exists and has data
+                Ok(!account.data.is_empty())
+            }
+            Err(_) => Ok(false), // Account doesn't exist
+        }
+    }
+    
+    /// Get the current balance in the automation account
+    /// Returns 0 if the account doesn't exist
+    pub async fn get_automation_balance(&self, authority: &Pubkey) -> Result<u64> {
+        let (automation_address, _) = ore_api::state::automation_pda(*authority);
+        match self.rpc.get_account(&automation_address).await {
+            Ok(account) => {
+                // Automation struct layout (with 8-byte discriminator prefix):
+                // - discriminator: [u8; 8] (offset 0-7)
+                // - amount: u64 (offset 8-15)
+                // - authority: Pubkey (offset 16-47)
+                // - balance: u64 (offset 48-55)
+                // - executor: Pubkey (offset 56-87)
+                // - fee: u64 (offset 88-95)
+                // - strategy: u64 (offset 96-103)
+                // - mask: u64 (offset 104-111)
+                // - reload: u64 (offset 112-119)
+                if account.data.len() >= 56 {
+                    let balance = u64::from_le_bytes(account.data[48..56].try_into().unwrap_or([0u8; 8]));
+                    Ok(balance)
+                } else {
+                    Ok(0)
+                }
+            }
+            Err(_) => Ok(0), // Account doesn't exist
+        }
+    }
+    
     /// Build Automate instruction using ore-api SDK
     ///
     /// This initializes/updates the user's automation + miner PDAs which are
@@ -520,6 +562,44 @@ impl OreClient {
             .context("Failed to send transaction")?;
 
         Ok(sig)
+    }
+    
+    /// Confirm a transaction with timeout
+    /// Uses confirmed commitment (1 confirmation) which is fast but reliable
+    pub async fn confirm_transaction(&self, signature: &Signature, timeout_secs: u64) -> Result<bool> {
+        use std::time::{Duration, Instant};
+        
+        let start = Instant::now();
+        let timeout = Duration::from_secs(timeout_secs);
+        
+        loop {
+            if start.elapsed() > timeout {
+                return Ok(false);
+            }
+            
+            match self.rpc.get_signature_status(signature).await {
+                Ok(Some(status)) => {
+                    match status {
+                        Ok(_) => {
+                            tracing::info!("Transaction {} confirmed", signature);
+                            return Ok(true);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Transaction {} failed: {:?}", signature, e);
+                            return Ok(false);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // Not yet processed, keep waiting
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+                Err(e) => {
+                    tracing::debug!("Error checking signature status: {}", e);
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+            }
+        }
     }
     
     /// Get current slot

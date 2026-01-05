@@ -13,21 +13,31 @@ async function fetchApi<T>(
   endpoint: string,
   options: RequestInit = {}
 ): Promise<T> {
-  const response = await fetch(`${API_URL}${endpoint}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...options.headers,
-    },
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
+  
+  try {
+    const response = await fetch(`${API_URL}${endpoint}`, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        ...options.headers,
+      },
+    });
+    clearTimeout(timeoutId);
 
-  const data = await response.json();
+    const data = await response.json();
   
-  if (!data.success && data.error) {
-    throw new Error(data.error);
+    if (!data.success && data.error) {
+      throw new Error(data.error);
+    }
+  
+    return data;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    throw error;
   }
-  
-  return data;
 }
 
 // =========================================================================
