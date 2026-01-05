@@ -371,9 +371,10 @@ impl StrategyEngine {
                                         amount: deploy_amount,
                                     });
                                     
+                                    let blocks_count = selected_squares.iter().filter(|&&b| b).count();
                                     info!(
-                                        "Submitted deploy: wallet={}, block={}, amount={} lamports, tx={}",
-                                        config.wallet, block_index, deploy_amount, signature
+                                        "Submitted deploy: wallet={}, blocks={} ({:?}), amount={} lamports, tx={}",
+                                        config.wallet, blocks_count, selected_blocks, deploy_amount, signature
                                     );
                                 }
                                 Err(e) => {
@@ -393,9 +394,10 @@ impl StrategyEngine {
                     let current_round = round.round_id;
                     loop {
                         sleep(Duration::from_millis(500)).await;
-                        if let Ok(new_round) = ore_client.get_current_round_state().await {
-                            if new_round.round_id != current_round {
-                                info!("Round {} ended, moving to round {}", current_round, new_round.round_id);
+                        // Only need the board's round_id here (cheaper than fetching the full round account)
+                        if let Ok(board) = ore_client.get_board_state().await {
+                            if board.round_id != current_round {
+                                info!("Round {} ended, moving to round {}", current_round, board.round_id);
                                 break;
                             }
                         }
@@ -410,55 +412,127 @@ impl StrategyEngine {
     }
     
     /// Wait until we're in the submission window (near end of round)
+    /// OPTIMIZED: Uses parallel RPC calls with timeouts to avoid blocking
     async fn wait_for_submission_window(ore_client: &OreClient) -> Result<RoundState> {
-        let mut log_counter = 0u32;
-        
+        use tokio::time::{timeout, Instant};
+
+        // Keep timeouts short so we can recover quickly from slow RPC.
+        const RPC_TIMEOUT: Duration = Duration::from_millis(1000);
+        // Target the *actual* end-of-round window. 10 slots ~= ~4s at ~400ms/slot.
+        // This aligns much better with the README timing (T-2s snapshot, T-1s submit)
+        // than the previous 30-slot (~12s) trigger.
+        const SUBMISSION_WINDOW_SLOTS: u64 = 10;
+        const BOARD_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
+
+        let mut last_board_fetch = Instant::now() - BOARD_REFRESH_INTERVAL;
+        let mut cached_board: Option<crate::ore::BoardState> = None;
+        let mut consecutive_failures: u32 = 0;
+
         loop {
-            let round = ore_client.get_current_round_state().await?;
-            let board = ore_client.get_board_state().await?;
-            
-            // If end_slot is MAX, round hasn't started - wait
-            if board.end_slot == u64::MAX {
+            // Refresh board state occasionally (end_slot changes only once per round).
+            if cached_board.is_none() || last_board_fetch.elapsed() >= BOARD_REFRESH_INTERVAL {
+                match timeout(RPC_TIMEOUT, ore_client.get_board_state()).await {
+                    Ok(Ok(board)) => {
+                        cached_board = Some(board);
+                        last_board_fetch = Instant::now();
+                        consecutive_failures = 0;
+                    }
+                    Ok(Err(e)) => {
+                        debug!("Board fetch error: {}", e);
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                    }
+                    Err(_) => {
+                        debug!("Board fetch timeout (>1s)");
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                    }
+                }
+            }
+
+            let Some(board) = cached_board.clone() else {
+                // Back off slightly to avoid a tight failure loop when RPC is down.
                 sleep(Duration::from_millis(100)).await;
                 continue;
+            };
+
+            // If end_slot is MAX, round hasn't started yet.
+            if board.end_slot == u64::MAX {
+                sleep(Duration::from_millis(200)).await;
+                continue;
             }
-            
-            let current_slot = ore_client.rpc().get_slot().await.unwrap_or(0);
+
+            let current_slot = match timeout(RPC_TIMEOUT, ore_client.rpc().get_slot()).await {
+                Ok(Ok(s)) => {
+                    consecutive_failures = 0;
+                    s
+                }
+                Ok(Err(e)) => {
+                    debug!("Slot fetch error: {}", e);
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                Err(_) => {
+                    debug!("Slot fetch timeout (>1s)");
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+
             let slots_remaining = if current_slot >= board.end_slot {
                 0
             } else {
                 board.end_slot - current_slot
             };
-            
-            // Log every 10 iterations to avoid spam
-            log_counter += 1;
-            if log_counter % 10 == 1 || slots_remaining <= 30 {
-                debug!("Waiting for submission window: slots_remaining={}, round_id={}, total_deployed={}", 
-                    slots_remaining, round.round_id, round.total_deployed);
-            }
-            
-            // Submit when 30 or fewer slots remaining (about 12 seconds) - gives us more buffer
-            if slots_remaining <= 30 && slots_remaining > 0 {
-                info!("Entering submission window: {} slots remaining (~{:.1}s)", slots_remaining, slots_remaining as f64 * 0.4);
-                return Ok(round);
-            }
-            
-            // Never sleep when under 40 slots - just keep polling
-            if slots_remaining > 0 && slots_remaining <= 40 {
-                // No sleep - continuous polling
+
+            // If round advanced, force a board refresh next loop.
+            if slots_remaining == 0 {
+                cached_board = None;
+                sleep(Duration::from_millis(50)).await;
                 continue;
             }
-            
-            if slots_remaining == 0 {
-                // Round just ended, poll fast to catch start of new round
-                sleep(Duration::from_millis(50)).await;
-            } else if slots_remaining > 60 {
-                // Long wait
-                sleep(Duration::from_millis(100)).await;
-            } else {
-                // Getting closer (60-20 slots), poll fast
-                sleep(Duration::from_millis(20)).await;
+
+            if slots_remaining <= SUBMISSION_WINDOW_SLOTS {
+                info!(
+                    "Entering submission window: {} slots remaining (~{:.1}s), round_id={}",
+                    slots_remaining,
+                    slots_remaining as f64 * 0.4,
+                    board.round_id
+                );
+
+                match timeout(Duration::from_millis(1500), ore_client.get_current_round_state()).await {
+                    Ok(Ok(round)) => return Ok(round),
+                    Ok(Err(e)) => {
+                        warn!("Failed to fetch round state at window entry: {}", e);
+                    }
+                    Err(_) => {
+                        warn!("Round state fetch timeout at window entry");
+                    }
+                }
+
+                // If the round-state fetch failed, retry quickly but never spin.
+                sleep(Duration::from_millis(30)).await;
+                continue;
             }
+
+            // Dynamic polling cadence: frequent near the end, gentler earlier.
+            let sleep_ms = if slots_remaining > 120 {
+                250
+            } else if slots_remaining > 60 {
+                120
+            } else if slots_remaining > 25 {
+                60
+            } else {
+                30
+            };
+
+            // Extra backoff when RPC is unhappy.
+            let backoff_ms = match consecutive_failures {
+                0..=2 => 0,
+                3..=6 => 50,
+                _ => 150,
+            };
+            sleep(Duration::from_millis(sleep_ms + backoff_ms)).await;
         }
     }
     
@@ -670,17 +744,22 @@ impl StrategyEngine {
 
         // Check if miner PDA exists and needs checkpointing.
         // The ORE deploy instruction requires: miner.checkpoint_id == miner.round_id
-        // So we must checkpoint the miner's LAST round (miner.round_id), not the board's round.
+        // If miner participated in a previous round, we must checkpoint that round first.
         // IMPORTANT: Checkpoint must be sent as a SEPARATE transaction before deploy
         // because Solana instructions in the same tx see original state, not modified state.
         let miner_data = ore_client.get_miner_data(&wallet_pubkey).await?;
         let needs_checkpoint = match &miner_data {
             Some(m) => {
+                // Need checkpoint if:
+                // 1. checkpoint_id != round_id (haven't checkpointed last participation), OR
+                // 2. miner.round_id > 0 AND miner.round_id < board.round_id (participated in old round)
+                let needs_cp = (m.checkpoint_id != m.round_id) || 
+                               (m.round_id > 0 && m.round_id < board.round_id);
                 info!(
-                    "Miner state: round_id={}, checkpoint_id={}, needs_checkpoint={}",
-                    m.round_id, m.checkpoint_id, m.checkpoint_id != m.round_id
+                    "Miner state: round_id={}, checkpoint_id={}, board_round={}, needs_checkpoint={}",
+                    m.round_id, m.checkpoint_id, board.round_id, needs_cp
                 );
-                m.checkpoint_id != m.round_id && m.round_id > 0
+                needs_cp
             }
             None => {
                 info!("Miner PDA does not exist yet - no checkpoint needed");
@@ -702,37 +781,59 @@ impl StrategyEngine {
                 miner_round_id,
             )?;
             
+            // Add compute budget instructions for priority (checkpoint needs to land fast)
+            let cu_limit_ix = solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(50_000);
+            let cu_price_ix = solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(100_000); // 100k micro-lamports per CU
+            
             let blockhash = ore_client.get_latest_blockhash().await?;
             
             // Build and sign checkpoint transaction (need wallet_manager for signing)
             if let Some(ref wm) = wallet_manager {
                 let mut checkpoint_tx = solana_sdk::transaction::Transaction::new_with_payer(
-                    &[checkpoint_ix],
+                    &[cu_limit_ix, cu_price_ix, checkpoint_ix],
                     Some(&wallet_pubkey),
                 );
                 checkpoint_tx.message.recent_blockhash = blockhash;
                 wm.sign_transaction(wallet, &mut checkpoint_tx).await
                     .context("Failed to sign checkpoint transaction")?;
                 
-                // Send checkpoint transaction via RPC (not Jito - doesn't need priority)
+                // Send checkpoint transaction via RPC with priority fee
                 match ore_client.send_transaction(&checkpoint_tx).await {
                     Ok(sig) => {
-                        info!("Checkpoint transaction sent: {}", sig);
-                        // Wait a bit for confirmation
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        info!("Checkpoint transaction sent with priority fee: {}", sig);
+                        
+                        // Wait for RPC confirmation (up to 5 seconds)
+                        let confirmed = ore_client.confirm_transaction(&sig, 5).await.unwrap_or(false);
+                        
+                        if confirmed {
+                            info!("Checkpoint transaction confirmed via RPC: {}", sig);
+                        } else {
+                            // Fallback: poll miner state to verify checkpoint applied
+                            warn!("RPC confirm timed out, checking miner state...");
+                            let mut checkpoint_confirmed = false;
+                            for attempt in 0..5 {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+                                if let Some(m) = ore_client.get_miner_data(&wallet_pubkey).await? {
+                                    if m.checkpoint_id == m.round_id {
+                                        info!(
+                                            "Checkpoint verified via miner state after {}ms: checkpoint_id={} == round_id={}",
+                                            (attempt + 1) * 400, m.checkpoint_id, m.round_id
+                                        );
+                                        checkpoint_confirmed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            if !checkpoint_confirmed {
+                                warn!("Checkpoint may not have confirmed - proceeding anyway");
+                            }
+                        }
                     }
                     Err(e) => {
                         // Checkpoint might fail if already done or round expired - that's OK
                         warn!("Checkpoint transaction failed (may be OK): {}", e);
                     }
-                }
-                
-                // Re-fetch miner data to confirm checkpoint worked
-                if let Some(m) = ore_client.get_miner_data(&wallet_pubkey).await? {
-                    info!(
-                        "After checkpoint: round_id={}, checkpoint_id={}",
-                        m.round_id, m.checkpoint_id
-                    );
                 }
             } else {
                 warn!("No wallet manager - cannot sign checkpoint transaction server-side");
@@ -740,9 +841,82 @@ impl StrategyEngine {
         }
         
         // Build deploy instruction using ore-api SDK (squares already passed in)
-        // We do NOT include automate in the same tx because Solana instructions
-        // see original state, not modified state from prior instructions.
-        // Deploy will see empty automation account and use the direct signer path.
+        // IMPORTANT: ORE v3 requires the automation account PDA to exist before deploying.
+        // The automation account is created by calling `automate` instruction first.
+        // For ORE v3, if an automation account exists, deploy MUST use the automation path.
+        // We need to ensure the automation account has sufficient balance before deploying.
+        // Calculate needed balance: deploy_amount * num_squares (squares we're deploying to)
+        let num_squares = squares.iter().filter(|&&s| s).count() as u64;
+        let needed_balance = deploy_amount.saturating_mul(num_squares.max(1));
+        
+        info!("Automate config: deploy_amount={} lamports ({} SOL), num_squares={}, needed_balance={}", 
+              deploy_amount, deploy_amount as f64 / 1_000_000_000.0, num_squares, needed_balance);
+        
+        // Check existing automation balance and only deposit the difference
+        let current_balance = ore_client.get_automation_balance(&wallet_pubkey).await.unwrap_or(0);
+        let deposit_needed = if current_balance >= needed_balance {
+            0 // Already have enough
+        } else {
+            needed_balance - current_balance
+        };
+        
+        // Only call automate if we need to deposit more funds
+        if deposit_needed > 0 {
+            info!("Automation setup: amount_per_square={} lamports ({} SOL), balance_needed={}, depositing={}", 
+                  deploy_amount, deploy_amount as f64 / 1_000_000_000.0, needed_balance, deposit_needed);
+        
+            // ORE v3 AutomationStrategy enum: 0=Random, 1=Preferred, 2=Discretionary
+            let automate_ix = ore_client.build_automate_instruction(
+                &wallet_pubkey,  // signer
+                deploy_amount,   // amount per square (MUST be in lamports)
+                deposit_needed,  // deposit - only what we need to add (lamports)
+                &wallet_pubkey,  // executor = self (discretionary mode)
+                0,               // fee = 0 (no executor fee since we're our own executor)
+                0,               // mask = 0 (we specify squares in deploy for discretionary)
+                2,               // strategy = 2 (Discretionary - use executor's provided mask)
+                false,           // reload = false
+            )?;
+            
+            info!("Built automate instruction with amount={} lamports for {} squares", deploy_amount, num_squares);
+            
+            let cu_limit_ix = solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(400_000);
+            let cu_price_ix = solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(100_000);
+            
+            let blockhash = ore_client.get_latest_blockhash().await?;
+            
+            if let Some(ref wm) = wallet_manager {
+                let mut automate_tx = solana_sdk::transaction::Transaction::new_with_payer(
+                    &[cu_limit_ix, cu_price_ix, automate_ix],
+                    Some(&wallet_pubkey),
+                );
+                automate_tx.message.recent_blockhash = blockhash;
+                wm.sign_transaction(wallet, &mut automate_tx).await
+                    .context("Failed to sign automate transaction")?;
+                
+                match ore_client.send_transaction(&automate_tx).await {
+                    Ok(sig) => {
+                        info!("Automate transaction sent: {}", sig);
+                        
+                        // Wait for confirmation
+                        let confirmed = ore_client.confirm_transaction(&sig, 5).await.unwrap_or(false);
+                        if confirmed {
+                            info!("Automate transaction confirmed - automation account funded: {}", sig);
+                        } else {
+                            warn!("Automate confirmation timed out - proceeding anyway");
+                        }
+                    }
+                    Err(e) => {
+                        // May fail if already funded - that's OK
+                        warn!("Automate transaction failed (may be OK): {}", e);
+                    }
+                }
+            } else {
+                warn!("No wallet manager - cannot fund automation account");
+            }
+        } else {
+            info!("Automation balance sufficient: {} lamports (need {})", current_balance, needed_balance);
+        }
+        
         let deploy_ix = ore_client.build_deploy_instruction(
             &wallet_pubkey,
             &wallet_pubkey, // authority is same as signer for user deploys
@@ -753,18 +927,22 @@ impl StrategyEngine {
         
         info!("Deploy instruction built: program={}", deploy_ix.program_id);
         
+        // Add compute budget for priority fee on deploy
+        let cu_limit_ix = solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(500_000);
+        let cu_price_ix = solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(100_000); // 100k micro-lamports per CU
+        
         // Get recent blockhash
         let blockhash = ore_client.get_latest_blockhash().await?;
         info!("Blockhash: {}", blockhash);
         
-        // Build transaction directly (no Jito tip - disabled)
+        // Build transaction with compute budget + deploy (no Jito tip)
         let mut tx = solana_sdk::transaction::Transaction::new_with_payer(
-            &[deploy_ix],
+            &[cu_limit_ix, cu_price_ix, deploy_ix],
             Some(&wallet_pubkey),
         );
         tx.message.recent_blockhash = blockhash;
 
-        info!("Transaction built with deploy instruction (no tip)");
+        info!("Transaction built with priority fee + deploy instruction");
         
         // Check if we can sign server-side (automine)
         if let Some(ref wm) = wallet_manager {
