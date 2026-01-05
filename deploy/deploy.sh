@@ -15,6 +15,7 @@ echo "==================================="
 # Variables
 INSTALL_DIR="/opt/orevault"
 USER="orevault"
+REPO_URL="https://github.com/ap42213/OREvaultMiner.git"
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then
@@ -60,26 +61,41 @@ echo "7. Setting up PostgreSQL..."
 sudo -u postgres psql -c "CREATE USER orevault WITH PASSWORD 'change_this_password';" 2>/dev/null || true
 sudo -u postgres psql -c "CREATE DATABASE orevault OWNER orevault;" 2>/dev/null || true
 
-echo "8. Copying application files..."
-# In production, you would clone from git or copy from CI/CD
-# git clone https://github.com/your-repo/orevault.git $INSTALL_DIR
+echo "8. Fetching application code..."
+if [ ! -d "$INSTALL_DIR/.git" ]; then
+  rm -rf "$INSTALL_DIR"
+  sudo -u "$USER" git clone "$REPO_URL" "$INSTALL_DIR"
+else
+  cd "$INSTALL_DIR"
+  sudo -u "$USER" git fetch --all
+  sudo -u "$USER" git reset --hard origin/main
+fi
 
-echo "9. Building backend..."
+echo "9. Ensuring backend env file exists..."
+if [ ! -f "$INSTALL_DIR/backend/.env" ]; then
+  cp "$INSTALL_DIR/backend/.env.example" "$INSTALL_DIR/backend/.env"
+  chown "$USER:$USER" "$INSTALL_DIR/backend/.env"
+  echo "Created $INSTALL_DIR/backend/.env from .env.example - EDIT THIS BEFORE STARTING."
+fi
+
+echo "10. Installing Rust for orevault user (if needed)..."
+sudo -u "$USER" bash -lc 'command -v cargo >/dev/null 2>&1 || (curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y)'
+
+echo "11. Building backend (release)..."
 cd $INSTALL_DIR/backend
-sudo -u $USER cargo build --release
+sudo -u "$USER" bash -lc 'cd /opt/orevault/backend && ~/.cargo/bin/cargo build --release'
 
-echo "10. Running database migrations..."
-sudo -u $USER ./target/release/orevault migrate
+echo "NOTE: DB migrations run automatically on backend startup (sqlx::migrate!)."
 
-echo "11. Installing systemd service..."
+echo "12. Installing systemd service..."
 cp $INSTALL_DIR/deploy/orevault.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable orevault
 
-echo "12. Starting service..."
-systemctl start orevault
+echo "13. Restarting service..."
+systemctl restart orevault
 
-echo "13. Checking service status..."
+echo "14. Checking service status..."
 systemctl status orevault --no-pager
 
 echo ""
@@ -88,11 +104,10 @@ echo "Deployment Complete!"
 echo "==================================="
 echo ""
 echo "Next steps:"
-echo "1. Configure .env file: $INSTALL_DIR/backend/.env"
-echo "2. Set up Helius RPC API key"
-echo "3. Configure firewall (ufw allow 3001)"
-echo "4. Set up SSL with nginx (optional)"
-echo "5. Deploy frontend to Vercel"
+echo "1. Configure .env file: $INSTALL_DIR/backend/.env (DATABASE_URL, RPC_URL, etc.)"
+echo "2. Configure firewall (ufw allow 3001)"
+echo "3. (Recommended) Put nginx in front + SSL"
+echo "4. Deploy frontend to Vercel (set NEXT_PUBLIC_API_URL + NEXT_PUBLIC_WS_URL)"
 echo ""
 echo "View logs: journalctl -u orevault -f"
 echo ""
