@@ -42,6 +42,16 @@ interface Transaction {
   timestamp: number;
 }
 
+interface Bet {
+  signature: string;
+  block: number;
+  amount: number;
+  status: 'pending' | 'won' | 'lost';
+  reward?: number;
+  roundId?: number;
+  timestamp: number;
+}
+
 interface OreVaultState {
   // Mining wallet (from backend)
   miningWallet: string | null;
@@ -62,6 +72,9 @@ interface OreVaultState {
   // Recent transactions
   transactions: Transaction[];
   
+  // Live bets tracking
+  bets: Bet[];
+  
   // Balances
   unclaimedSol: number;
   unclaimedOre: number;
@@ -81,6 +94,9 @@ interface OreVaultState {
   addTransaction: (tx: Transaction) => void;
   updateTransactionStatus: (sig: string, status: 'confirmed' | 'failed') => void;
   updateBalances: (sol: number, ore: number, refined: number) => void;
+  addBet: (bet: Bet) => void;
+  updateBetResult: (sig: string, status: 'won' | 'lost', reward?: number) => void;
+  clearBets: () => void;
   handleWsMessage: (message: WsMessage) => void;
 }
 
@@ -106,6 +122,7 @@ export const useOreVaultStore = create<OreVaultState>((set, get) => ({
   
   aiAnalysis: null,
   transactions: [],
+  bets: [],
   
   unclaimedSol: 0,
   unclaimedOre: 0,
@@ -136,6 +153,18 @@ export const useOreVaultStore = create<OreVaultState>((set, get) => ({
     unclaimedOre: ore,
     refinedOre: refined,
   }),
+  
+  addBet: (bet) => set((state) => ({
+    bets: [bet, ...state.bets].slice(0, 100), // Keep last 100 bets
+  })),
+  
+  updateBetResult: (sig, status, reward) => set((state) => ({
+    bets: state.bets.map(bet =>
+      bet.signature === sig ? { ...bet, status, reward } : bet
+    ),
+  })),
+  
+  clearBets: () => set({ bets: [] }),
   
   handleWsMessage: (message) => {
     const { type, payload } = message;
@@ -184,14 +213,31 @@ export const useOreVaultStore = create<OreVaultState>((set, get) => ({
           status: 'pending',
           timestamp: Date.now(),
         });
+        // Also track as a bet for LiveBets component
+        get().addBet({
+          signature: payload.signature,
+          block: payload.block,
+          amount: payload.amount,
+          status: 'pending',
+          roundId: get().round.roundId ?? undefined,
+          timestamp: Date.now(),
+        });
         break;
         
       case 'tx:confirmed':
         get().updateTransactionStatus(payload.signature, 'confirmed');
+        // Update bet result - reward > 0 means we won
+        const hasReward = payload.reward && payload.reward > 0;
+        get().updateBetResult(
+          payload.signature,
+          hasReward ? 'won' : 'lost',
+          payload.reward
+        );
         break;
         
       case 'tx:failed':
         get().updateTransactionStatus(payload.signature, 'failed');
+        get().updateBetResult(payload.signature, 'lost');
         break;
         
       case 'balance:update':

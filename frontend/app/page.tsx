@@ -7,6 +7,8 @@ import { BetConfig } from '@/components/BetConfig';
 import { AiDecisions } from '@/components/AiDecisions';
 import { Stats } from '@/components/Stats';
 import { Grid } from '@/components/Grid';
+import { LiveBets } from '@/components/LiveBets';
+import { WinLossTracker } from '@/components/WinLossTracker';
 import { useOreVaultStore } from '@/lib/store';
 
 export default function Home() {
@@ -38,14 +40,16 @@ export default function Home() {
             <ClaimPanel />
           </div>
 
-          {/* Center Column - Config & Grid */}
+          {/* Center Column - Config, Tracker & Grid */}
           <div className="space-y-6">
             <BetConfig />
+            <WinLossTracker />
             <Grid />
           </div>
 
-          {/* Right Column - AI & Stats */}
+          {/* Right Column - Live Bets, AI & Stats */}
           <div className="space-y-6">
+            <LiveBets />
             <AiDecisions />
             <Stats />
           </div>

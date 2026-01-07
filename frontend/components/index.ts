@@ -6,3 +6,5 @@ export { BetConfig } from './BetConfig';
 export { AiDecisions } from './AiDecisions';
 export { Stats } from './Stats';
 export { Grid } from './Grid';
+export { LiveBets } from './LiveBets';
+export { WinLossTracker } from './WinLossTracker';
